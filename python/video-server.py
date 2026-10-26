@@ -12,6 +12,9 @@ import subprocess
 import os
 import time
 import threading
+import socket
+import struct
+import fcntl
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -159,6 +162,211 @@ def read_modem_signal() -> str:
     return "{0} {1}%".format(tech, quality).strip()
 
 
+def crc_x25(data: bytes, crc: int = 0xFFFF) -> int:
+    for b in data:
+        tmp = b ^ (crc & 0xFF)
+        tmp = (tmp ^ (tmp << 4)) & 0xFF
+        crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+    return crc
+
+
+# msgid -> (CRC_EXTRA, base payload length)
+MAVLINK_MSGS = {1: (124, 31), 147: (154, 36)}
+
+
+# Returns (msgid, compid, payload) for each valid SYS_STATUS / BATTERY_STATUS frame in buf,
+# ignoring garbage and everything else
+def parse_mavlink_frames(buf: bytes):
+    frames = []
+    i = 0
+    while i < len(buf):
+        stx = buf[i]
+        if stx == 0xFE and i + 6 <= len(buf):
+            length = buf[i + 1]
+            hdr_len, signature = 5, 0
+            compid, msgid = buf[i + 4], buf[i + 5]
+        elif stx == 0xFD and i + 10 <= len(buf):
+            length = buf[i + 1]
+            hdr_len = 9
+            signature = 13 if buf[i + 2] & 0x01 else 0
+            compid = buf[i + 6]
+            msgid = int.from_bytes(buf[i + 7:i + 10], "little")
+        else:
+            i += 1
+            continue
+
+        end = i + 1 + hdr_len + length
+        if msgid in MAVLINK_MSGS and end + 2 + signature <= len(buf):
+            extra, base_len = MAVLINK_MSGS[msgid]
+            crc = crc_x25(buf[i + 1:end] + bytes([extra]))
+            if crc == int.from_bytes(buf[end:end + 2], "little"):
+                # v2 drops trailing zero bytes of the payload
+                payload = buf[i + 1 + hdr_len:end].ljust(base_len, b"\0")
+                frames.append((msgid, compid, payload))
+                i = end + 2 + signature
+                continue
+        i += 1
+    return frames
+
+
+def decode_sys_status(payload: bytes):
+    mv, ca, rem = struct.unpack_from("<Hh", payload, 14) + struct.unpack_from("<b", payload, 30)
+    return (None if mv == 65535 else mv / 1000,
+            None if ca == -1 else ca / 100,
+            None if rem == -1 else rem)
+
+
+def decode_battery_status(payload: bytes):
+    mah = struct.unpack_from("<i", payload, 0)[0]
+    return payload[32], None if mah == -1 else mah
+
+
+# Updates state in place from one parsed frame. Only the autopilot (compid 1) is trusted.
+def apply_mavlink(state: dict, msgid: int, compid: int, payload: bytes, now: float):
+    if compid != 1:
+        return
+    if msgid == 1:
+        state["volts"], state["amps"], state["pct"] = decode_sys_status(payload)
+        state["ts"] = now
+    elif msgid == 147:
+        batt_id, mah = decode_battery_status(payload)
+        if batt_id == 0:
+            state["mah"] = mah
+
+
+def fc_line(state: dict, now: float) -> str:
+    if now - state.get("ts", -1e9) > 5:
+        return ""
+    parts = []
+    if state.get("volts") is not None:
+        parts.append("{0:.1f}V".format(state["volts"]))
+    if state.get("amps") is not None:
+        parts.append("{0:.1f}A".format(state["amps"]))
+    if state.get("pct") is not None:
+        parts.append("{0}%".format(state["pct"]))
+    if state.get("mah") is not None:
+        parts.append("{0}mAh".format(state["mah"]))
+    return " ".join(["FC"] + parts) if parts else ""
+
+
+# Listens on a UDP port that the user adds as a mavlink-router destination in Rpanion
+class MavlinkBattery(threading.Thread):
+    def __init__(self, port: int):
+        super().__init__(daemon=True)
+        self.port = port
+        self.state = {}
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("127.0.0.1", self.port))
+        except OSError as e:
+            print("Battery overlay: cannot bind UDP 127.0.0.1:{0} ({1}), FC battery disabled".format(self.port, e))
+            return
+        while True:
+            data = sock.recv(2048)
+            now = time.monotonic()
+            for msgid, compid, payload in parse_mavlink_frames(data):
+                apply_mavlink(self.state, msgid, compid, payload, now)
+
+
+# Returns (bus volts, amps, shunt saturated). Raw shunt is signed, 2.5 uV/LSB;
+# bus is unsigned, 1.25 mV/LSB. Full scale is 81.92 mV, so a clipped reading is flagged.
+def ina226_convert(bus_raw: int, shunt_raw: int, shunt_ohms: float):
+    volts = bus_raw * 1.25e-3
+    amps = shunt_raw * 2.5e-6 / shunt_ohms
+    return volts, amps, abs(shunt_raw) >= 32767
+
+
+LIPO_CURVE = [(4.20, 100), (4.15, 95), (4.11, 90), (4.08, 85), (4.02, 80), (3.98, 75), (3.95, 70),
+              (3.91, 65), (3.87, 60), (3.85, 55), (3.84, 50), (3.82, 45), (3.80, 40), (3.79, 35),
+              (3.77, 30), (3.75, 25), (3.73, 20), (3.71, 15), (3.69, 10), (3.61, 5), (3.27, 0)]
+
+
+def lipo_percent(cell_volts: float) -> float:
+    if cell_volts >= LIPO_CURVE[0][0]:
+        return 100
+    for (v_hi, p_hi), (v_lo, p_lo) in zip(LIPO_CURVE, LIPO_CURVE[1:]):
+        if cell_volts >= v_lo:
+            return p_lo + (p_hi - p_lo) * (cell_volts - v_lo) / (v_hi - v_lo)
+    return 0
+
+
+def pack_percent(volts: float, cells: int):
+    if cells <= 0:
+        return None
+    return lipo_percent(volts / cells)
+
+
+def format_pi_line(volts, amps, saturated, pct) -> str:
+    if volts is None:
+        return ""
+    parts = ["{0:.1f}V".format(volts), "{0:.1f}A{1}".format(amps, "+" if saturated else "")]
+    if pct is not None:
+        parts.append("{0:.0f}%".format(pct))
+    return "PI " + " ".join(parts)
+
+
+def env_number(name: str, default):
+    try:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return int(value, 0) if isinstance(default, int) else float(value)
+    except ValueError:
+        return default
+
+
+# Minimal INA226 reader over /dev/i2c-N using only os/fcntl. Reopens on error, at most every 10 s.
+class Ina226:
+    I2C_SLAVE = 0x0703
+
+    def __init__(self):
+        self.bus = env_number("INA226_BUS", 1)
+        self.addr = env_number("INA226_ADDR", 0x40)
+        self.shunt_ohms = env_number("INA226_SHUNT_OHMS", 0.1)
+        if self.shunt_ohms <= 0:
+            self.shunt_ohms = 0.1
+        self.cells = env_number("PI_BATT_CELLS", 2)
+        self.fd = None
+        self.next_try = 0.0
+
+    def _read(self, reg: int) -> int:
+        os.write(self.fd, bytes([reg]))
+        return int.from_bytes(os.read(self.fd, 2), "big")
+
+    def line(self, now: float) -> str:
+        if self.fd is None:
+            if now < self.next_try:
+                return ""
+            self.next_try = now + 10
+            try:
+                self.fd = os.open("/dev/i2c-{0}".format(self.bus), os.O_RDWR)
+                fcntl.ioctl(self.fd, self.I2C_SLAVE, self.addr)
+                os.write(self.fd, bytes([0x00, 0x45, 0x27]))
+            except OSError:
+                self.close()
+                return ""
+        try:
+            shunt = self._read(0x01)
+            bus = self._read(0x02)
+        except OSError:
+            self.close()
+            return ""
+        if shunt >= 0x8000:
+            shunt -= 0x10000
+        volts, amps, saturated = ina226_convert(bus, shunt, self.shunt_ohms)
+        return format_pi_line(volts, amps, saturated, pack_percent(volts, self.cells))
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = None
+
+
 # Single background sampler shared by all streams, so slow commands (vcgencmd, mmcli)
 # never block the GLib main loop that drives the RTSP server
 class SystemStats(threading.Thread):
@@ -169,11 +377,15 @@ class SystemStats(threading.Thread):
         if cls._instance is None:
             cls._instance = SystemStats()
             cls._instance.start()
+            cls._instance.mavlink.start()
         return cls._instance
 
     def __init__(self):
         super().__init__(daemon=True)
         self.lines = ["", ""]
+        self.batt_lines = ["", ""]
+        self.mavlink = MavlinkBattery(env_number("STATS_MAVLINK_PORT", 14570))
+        self.ina = Ina226()
 
     def run(self):
         iface, last_bytes, last_cpu = "", None, read_cpu_times()
@@ -221,6 +433,7 @@ class SystemStats(threading.Thread):
             if slow["signal"]:
                 net += " | " + slow["signal"]
             self.lines = [net, " | ".join(sys_parts)]
+            self.batt_lines = [fc_line(self.mavlink.state, now), self.ina.line(now)]
 
 
 # Updates the "statsoverlay" textoverlay (if present) once per second with
@@ -229,6 +442,7 @@ def attach_stats(pipeline):
     overlay = pipeline.get_by_name("statsoverlay")
     if overlay is None:
         return None
+    battoverlay = pipeline.get_by_name("battoverlay")
 
     stats = SystemStats.get()
     frames = [0]
@@ -251,6 +465,8 @@ def attach_stats(pipeline):
         net, system = stats.lines
         system = "{0} | {1:.0f} fps".format(system, fps) if system else "{0:.0f} fps".format(fps)
         overlay.set_property("text", net + "\n" + system)
+        if battoverlay is not None:
+            battoverlay.set_property("text", "\n".join(l for l in stats.batt_lines if l))
         return True
 
     return GLib.timeout_add(1000, tick)
@@ -353,6 +569,8 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
             pipeline.append("clockoverlay time-format=\"%d-%b-%Y %H:%M:%S\" valignment=top halignment=left "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
             pipeline.append("textoverlay name=statsoverlay text=\"\" valignment=top halignment=right line-alignment=right "
+                            "font-desc=\"Sans 10\" shaded-background=true ypad=10")
+            pipeline.append("textoverlay name=battoverlay text=\"\" valignment=bottom halignment=left line-alignment=left "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
 
         # 3 options for H264: Rpi hardware compression (v4l2h264enc), Jetson hardware compression (nvv4l2h264enc)

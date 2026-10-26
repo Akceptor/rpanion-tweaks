@@ -9,6 +9,9 @@ A replacement `python/video-server.py` that adds a small on-screen display to th
 ```
 20-Oct-2026 13:38:00                   wwan0 ↓0.42 ↑2.10 Mbps | LTE 78%
                               CPU 34% | 61°C | 4.1W | UNDERVOLT | 25 fps
+
+FC 15.8V 12.3A 74% 1250mAh
+PI 7.6V 1.2A 68%
 ```
 
 | Field | Source | Notes |
@@ -20,6 +23,8 @@ A replacement `python/video-server.py` that adds a small on-screen display to th
 | `W` | `vcgencmd pmic_read_adc` | **Pi 5 only.** Board rails only — excludes USB devices such as the modem |
 | `UNDERVOLT` / `THROTTLED` | `vcgencmd get_throttled` | Only shown when there's a problem |
 | `fps` | frames reaching the encoder | Per viewer |
+| `FC ...` (bottom left) | MAVLink `SYS_STATUS` / `BATTERY_STATUS` over UDP | Flight controller battery. Hidden if no data for 5 s. See [Battery overlay](#battery-overlay) |
+| `PI ...` (bottom left) | INA226 on I2C | Companion battery, measured before the BEC. Hidden if the sensor is absent. See [Battery overlay](#battery-overlay) |
 
 Fields that aren't available on your hardware are hidden. Slow commands (`vcgencmd`, `mmcli`) run every 5 s in a background thread so they never stall the video.
 
@@ -35,6 +40,57 @@ The overlay is enabled by the existing **Timestamp** checkbox in Rpanion's Video
   # [Service]
   # Environment=STATS_IFACE=wwan0
   ```
+
+## Battery overlay
+
+A second overlay in the bottom-left corner shows two batteries. A line is hidden when its source has no data.
+
+### FC battery (MAVLink)
+
+Rpanion's mavlink-router has to send telemetry to the video server. In the web UI: **Flight Controller** → add a UDP endpoint with destination `127.0.0.1:14570`. The server listens on that port; to use another one, set `STATS_MAVLINK_PORT`. Only the autopilot's messages (component 1) are used.
+
+If the line never appears with no GCS connected, the FC isn't streaming battery messages to the Pi. On ArduPilot set `SRn_EXT_STAT` (n = the serial port wired to the Pi, e.g. `SR2_EXT_STAT` for SERIAL2) to `1` or higher.
+
+### Pi battery (INA226)
+
+Put an INA226 module on the battery side, between the companion battery and the BEC:
+
+| INA226 | Connect to |
+|---|---|
+| VCC | Pi 3.3V (pin 1) |
+| GND | Pi GND (common with the battery and BEC ground) |
+| SDA | GPIO2 (pin 3) |
+| SCL | GPIO3 (pin 5) |
+| IN+ | battery + |
+| IN− | BEC + |
+| VBUS | IN− (or battery +) — on most modules it is already connected internally, check yours |
+
+Enable I2C, give the service user access and check that the sensor is seen (`0x40` by default):
+
+```bash
+sudo raspi-config nonint do_i2c 0
+sudo usermod -aG i2c rpanion
+sudo apt install i2c-tools
+i2cdetect -y 1
+```
+
+Log out/in or restart `rpanion-server` after the group change.
+
+**Replace the shunt resistor.** Most modules ship with R100 (0.1 Ω). The INA226 maxes out at 81.92 mV across the shunt, so that is only ~0.82 A, while a Pi 5 plus a modem on 2S draws about 1.3 A. Swap it for R010 (0.01 Ω, ~8 A range) and set `INA226_SHUNT_OHMS=0.01`. When the reading is clipped, the overlay shows `0.8A+` instead of a wrong number.
+
+### Settings
+
+Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then add `Environment=...` lines under `[Service]`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `STATS_MAVLINK_PORT` | `14570` | UDP port on 127.0.0.1 for the FC battery |
+| `INA226_BUS` | `1` | I2C bus (`/dev/i2c-N`) |
+| `INA226_ADDR` | `0x40` | I2C address |
+| `INA226_SHUNT_OHMS` | `0.1` | Shunt resistance. `0.01` for R010 |
+| `PI_BATT_CELLS` | `2` | Cells in the Pi battery, for the %. `0` hides the % |
+
+The Pi battery % is a voltage estimate. It sags under load, so expect it to read low while the modem is busy. The table is for LiPo; Li-ion packs will read low.
 
 ## Install
 
