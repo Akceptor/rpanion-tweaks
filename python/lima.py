@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 
 from pymavlink.dialects.v20 import ardupilotmega as mavlink
 
@@ -176,13 +177,18 @@ def repack(msg, mav):
     return msg.pack(mav, force_mavlink1=v1)
 
 
+_XY_IGNORE = (mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
+              | mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE)
+
+
 def _unset(a, b):
     return a in (0, INT32_MAX) and b in (0, INT32_MAX)
 
 
 class Rewriter:
-    def __init__(self, store, fake_anchor, max_target_m):
+    def __init__(self, store, fake_anchor, max_target_m, clock=time.monotonic):
         self.store = store
+        self.clock = clock
         self.fake_anchor = fake_anchor
         self.max_target_m = max_target_m
         self.anchor = store.load()
@@ -194,9 +200,32 @@ class Rewriter:
             p.robust_parsing = True
         self._out = mavlink.MAVLink(None)
         self._logged = set()
+        self.vehicle_sysid = 1
+        self._warn_mav = mavlink.MAVLink(
+            None, srcComponent=mavlink.MAV_COMP_ID_ONBOARD_COMPUTER)
+        self._warnings = []
+        self._warned_at = {}
 
     def downlink(self, datagram):
         return self._process("down", datagram, True)
+
+    def uplink(self, datagram):
+        return self._process("up", datagram, False)
+
+    def take_warnings(self):
+        out, self._warnings = self._warnings, []
+        return out
+
+    def _warn(self, name, detail):
+        now = self.clock()
+        last = self._warned_at.get(name)
+        if last is not None and now - last < 1.0:
+            return
+        self._warned_at[name] = now
+        text = f"Lima: dropped {name} {detail}"[:50]
+        self._warn_mav.srcSystem = self.vehicle_sysid
+        msg = mavlink.MAVLink_statustext_message(mavlink.MAV_SEVERITY_WARNING, text.encode())
+        self._warnings.append(msg.pack(self._warn_mav))
 
     def _process(self, direction, datagram, to_fake):
         out = []
@@ -217,6 +246,10 @@ class Rewriter:
 
     def _handle(self, direction, msg, to_fake):
         name = msg.get_type()
+        if (direction == "down" and name == "HEARTBEAT"
+                and msg.type != mavlink.MAV_TYPE_GCS
+                and msg.autopilot != mavlink.MAV_AUTOPILOT_INVALID):
+            self.vehicle_sysid = msg.get_srcSystem()
         kind = classify(direction, name)
         if kind == "pass":
             return bytes(msg.get_msgbuf())
@@ -226,6 +259,8 @@ class Rewriter:
             self._track(msg)
         if kind == "convert":
             lat_f, lon_f, scale = CONVERT[name]
+            if name == "SET_POSITION_TARGET_GLOBAL_INT" and msg.type_mask & _XY_IGNORE == _XY_IGNORE:
+                return bytes(msg.get_msgbuf())
             if _unset(getattr(msg, lat_f), getattr(msg, lon_f)):
                 return bytes(msg.get_msgbuf())
         else:
@@ -236,11 +271,21 @@ class Rewriter:
                 return None
             lat_f, lon_f, scale = self._command_fields(msg)
         if self.anchor is None:
+            if not to_fake:
+                self._warn(name, "no anchor")
+            return None
+        if not to_fake and self.real_pos is None:
+            self._warn(name, "no position")
             return None
         convert = self.anchor.to_fake if to_fake else self.anchor.to_real
         lat = getattr(msg, lat_f) / scale
         lon = getattr(msg, lon_f) / scale
         lat, lon = convert(lat, lon)
+        if not to_fake:
+            dist = distance_m(*self.real_pos, lat, lon)
+            if not dist <= self.max_target_m:
+                self._warn(name, f"{dist / 1000:.1f}km")
+                return None
         if scale == 1.0:
             setattr(msg, lat_f, lat)
             setattr(msg, lon_f, lon)
@@ -258,6 +303,8 @@ class Rewriter:
         else:
             return
         if not ok:
+            return
+        if abs(msg.lat) > 900000000 or abs(msg.lon) > 1800000000:
             return
         lat, lon = msg.lat / 1e7, msg.lon / 1e7
         self.real_pos = (lat, lon)

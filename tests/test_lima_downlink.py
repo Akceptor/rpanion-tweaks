@@ -27,6 +27,14 @@ def gps(lat, lon, fix):
         0, fix, round(lat * 1e7), round(lon * 1e7), 500000, 100, 100, 0, 0, 10)
 
 
+def bad_gps(lat, lon):
+    return mavlink.MAVLink_gps_raw_int_message(0, 3, lat, lon, 500000, 100, 100, 0, 0, 10)
+
+
+def bad_gpi(lat, lon):
+    return mavlink.MAVLink_global_position_int_message(0, lat, lon, 500000, 1500, 0, 0, 0, 9000)
+
+
 def heartbeat():
     return mavlink.MAVLink_heartbeat_message(10, 3, 0, 0, 4, 3)
 
@@ -167,6 +175,17 @@ class DownlinkTest(unittest.TestCase):
         rw.downlink(frame(gpi(47.001, 8.002)))
         self.assertAlmostEqual(rw.real_pos[0], 47.001, places=6)
         self.assertAlmostEqual(rw.real_pos[1], 8.002, places=6)
+
+    def test_track_ignores_invalid_latlon(self):
+        rw = self.rewriter()
+        rw.downlink(frame(bad_gps(lima.INT32_MAX, lima.INT32_MAX)))
+        rw.downlink(frame(bad_gps(910000000, 0)))
+        rw.downlink(frame(bad_gps(0, -1810000000)))
+        self.assertIsNone(rw.anchor)
+        rw.downlink(frame(gps(*REAL, 3)))
+        rw.downlink(frame(bad_gpi(lima.INT32_MAX, lima.INT32_MAX)))
+        rw.downlink(frame(bad_gpi(0, 1810000000)))
+        self.assertEqual(rw.real_pos, REAL)
 
     def test_unlisted_message_dropped(self):
         rw = self.anchored()
