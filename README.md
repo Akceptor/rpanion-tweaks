@@ -47,23 +47,52 @@ A second overlay in the bottom-left corner shows two batteries. A line is hidden
 
 ### FC battery (MAVLink)
 
-Rpanion's mavlink-router has to send telemetry to the video server. In the web UI: **Flight Controller** → add a UDP endpoint with destination `127.0.0.1:14570`. The server listens on that port; to use another one, set `STATS_MAVLINK_PORT`. Only the autopilot's messages (component 1) are used.
+Rpanion's mavlink-router has to send telemetry to the video server. In the web UI, **Flight Controller** page:
+
+1. Stop telemetry (the destination list can't be edited while it runs).
+2. **Telemetry Destinations** → **UDP Client** → **Add new destination**: `127.0.0.1:14570` → **Add**. Keep the existing `127.0.0.1:14540`, Rpanion needs it.
+3. Start telemetry, then stop/start the video stream.
+
+The server listens on that port; to use another one, set `STATS_MAVLINK_PORT`. Only the autopilot's messages (component 1) are used. If the line shows `FC 0.0V`, the FC has no battery monitor configured (`BATT_MONITOR`).
 
 If the line never appears with no GCS connected, the FC isn't streaming battery messages to the Pi. On ArduPilot set `SRn_EXT_STAT` (n = the serial port wired to the Pi, e.g. `SR2_EXT_STAT` for SERIAL2) to `1` or higher.
 
 ### Pi battery (INA226)
 
-Put an INA226 module on the battery side, between the companion battery and the BEC:
+The INA226 goes on the **battery side**, between the companion battery and the BEC. That way it sees the real battery voltage (needed for the %) and the total current of the Pi and everything on its 5V rail.
 
-| INA226 | Connect to |
-|---|---|
-| VCC | Pi 3.3V (pin 1) |
-| GND | Pi GND (common with the battery and BEC ground) |
-| SDA | GPIO2 (pin 3) |
-| SCL | GPIO3 (pin 5) |
-| IN+ | battery + |
-| IN− | BEC + |
-| VBUS | IN− (or battery +) — on most modules it is already connected internally, check yours |
+Power path (thick wires):
+
+```
+battery + ──▶ IN+ ═[shunt]═ IN− ──▶ BEC in +        BEC out 5V ──▶ Pi 5V (pin 2)
+                             │
+                            VBUS (tie to IN−)
+battery − ─────────────────────────▶ BEC in −        BEC out GND ──▶ Pi GND
+```
+
+Signal side (thin wires, module → Pi header):
+
+```
+INA226   VCC ──▶ pin 1  (3.3V)
+         GND ──▶ pin 6  (GND)
+         SDA ──▶ pin 3  (GPIO2 / SDA)
+         SCL ──▶ pin 5  (GPIO3 / SCL)
+```
+
+| INA226 pin | Connect to | Notes |
+|---|---|---|
+| IN+ | battery + | Full current flows IN+ → shunt → IN−. Use the same wire gauge as the battery lead |
+| IN− | BEC input + | |
+| VBUS (`VBS`) | IN− | Bus voltage sense. Some modules tie it internally; others (e.g. CJMCU-226) have a separate pad that **must** be wired, or the voltage reads 0 |
+| VCC | Pi **3.3V** (pin 1) | **Not 5V.** The module's I2C pull-ups go to VCC; at 5V they would put 5V on the Pi's GPIO and can damage it |
+| GND | Pi GND (pin 6) | |
+| SDA | GPIO2 (pin 3) | |
+| SCL | GPIO3 (pin 5) | |
+| A0, A1 | leave as is | Both low = address `0x40`. Change them only for a second sensor, then set `INA226_ADDR` |
+
+- Battery − goes straight to BEC −, not through the module: the INA226 measures on the + side.
+- Keep SDA/SCL short (under ~20 cm) and away from ESC/motor wires.
+- Swap the shunt first (see below), then check with `i2cdetect` before closing the airframe.
 
 Enable I2C, give the service user access and check that the sensor is seen (`0x40` by default):
 
