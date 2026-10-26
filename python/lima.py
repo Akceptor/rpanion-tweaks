@@ -92,7 +92,6 @@ CONVERT = {
     "TERRAIN_REQUEST": ("lat", "lon", 1e7),
     "TERRAIN_REPORT": ("lat", "lon", 1e7),
     "SIMSTATE": ("lat", "lng", 1e7),
-    "SIM_STATE": ("lat", "lon", 1.0),
 }
 
 COMMAND_AWARE = frozenset({"MISSION_ITEM", "MISSION_ITEM_INT", "COMMAND_INT", "COMMAND_LONG"})

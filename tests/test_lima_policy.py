@@ -59,6 +59,16 @@ class PolicyTest(unittest.TestCase):
                 elif units == "deg":
                     self.assertEqual(scale, 1.0, (name, f))
 
+    def test_convert_has_single_position_pair(self):
+        msgs = dialect_messages()
+        for name, (lat, lon, _) in lima.CONVERT.items():
+            extra = (set(msgs[name].fieldnames) & LATLON) - {lat, lon}
+            self.assertEqual(extra, set(), name)
+
+    def test_sim_state_dropped(self):
+        for d in ("down", "up"):
+            self.assertEqual(lima.classify(d, "SIM_STATE"), "drop")
+
     def test_position_commands_and_frames(self):
         self.assertIn(mavlink.MAV_CMD_NAV_WAYPOINT, lima.POSITION_COMMANDS)
         self.assertIn(mavlink.MAV_CMD_DO_REPOSITION, lima.POSITION_COMMANDS)
