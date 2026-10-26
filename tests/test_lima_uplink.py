@@ -142,6 +142,51 @@ class UplinkTest(unittest.TestCase):
         self.assertEqual(rw.take_warnings(), [])
         self.assertEqual(self.anchored(with_pos=False).uplink(data), [data])
 
+    def sp_target(self, mask, lat, lon):
+        return mavlink.MAVLink_set_position_target_global_int_message(
+            0, 1, 1, mavlink.MAV_FRAME_GLOBAL_INT, mask, lat, lon,
+            10, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    def test_zero_latlon_uplink_guarded(self):
+        for name, m in (
+            ("SET_POSITION_TARGET_GLOBAL_INT", self.sp_target(0, 0, 0)),
+            ("SET_HOME_POSITION", mavlink.MAVLink_set_home_position_message(
+                1, 0, 0, 0, 0, 0, 0, [1, 0, 0, 0], 0, 0, 0)),
+            ("SET_GPS_GLOBAL_ORIGIN", mavlink.MAVLink_set_gps_global_origin_message(1, 0, 0, 0)),
+        ):
+            rw = self.anchored()
+            self.assertEqual(rw.uplink(frame(m)), [], name)
+            self.assertEqual(len(rw.take_warnings()), 1, name)
+
+    def test_mask_shortcut_needs_xyz(self):
+        rw = self.anchored()
+        lat, lon = self.fake_point(6000, 0)
+        xy = (mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
+              | mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE)
+        self.assertEqual(rw.uplink(frame(self.sp_target(xy, round(lat * 1e7), round(lon * 1e7)))), [])
+        self.assertEqual(len(rw.take_warnings()), 1)
+        lat, lon = self.fake_point(10, 0)
+        out = decode(b"".join(rw.uplink(frame(self.sp_target(xy, round(lat * 1e7), round(lon * 1e7))))))
+        self.assertLess(lima.distance_m(*REAL, out[0].lat_int / 1e7, out[0].lon_int / 1e7), 11)
+
+    def test_mask_shortcut_not_on_downlink(self):
+        rw = self.anchored()
+        mask = (mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
+                | mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE
+                | mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE)
+        data = frame(self.sp_target(mask, round(REAL[0] * 1e7), round(REAL[1] * 1e7)))
+        out = decode(b"".join(rw.downlink(data)))
+        self.assertEqual(len(out), 1)
+        self.assertLess(lima.distance_m(*FAKE, out[0].lat_int / 1e7, out[0].lon_int / 1e7), 1)
+
+    def test_do_orbit_converted(self):
+        rw = self.anchored()
+        lat, lon = self.fake_point(30, 0)
+        out = decode(b"".join(rw.uplink(frame(
+            cmd_long(mavlink.MAV_CMD_DO_ORBIT, 10, lat, lon, 10)))))
+        self.assertEqual(len(out), 1)
+        self.assertLess(lima.distance_m(*offset(*REAL, 30, 0), out[0].param5, out[0].param6), 1.0)
+
     def test_position_target_far_dropped(self):
         rw = self.anchored()
         lat, lon = self.fake_point(6000, 0)

@@ -100,7 +100,7 @@ CONVERT = {
 
 COMMAND_AWARE = frozenset({"MISSION_ITEM", "MISSION_ITEM_INT", "COMMAND_INT", "COMMAND_LONG"})
 
-POSITION_COMMANDS = frozenset(
+_EXPLICIT_POSITION_COMMANDS = frozenset(
     getattr(mavlink, "MAV_CMD_" + n) for n in (
         "NAV_WAYPOINT", "NAV_LOITER_UNLIM", "NAV_LOITER_TURNS", "NAV_LOITER_TIME",
         "NAV_LOITER_TO_ALT", "NAV_LAND", "NAV_TAKEOFF", "NAV_SPLINE_WAYPOINT",
@@ -110,6 +110,11 @@ POSITION_COMMANDS = frozenset(
         "NAV_FENCE_CIRCLE_INCLUSION", "NAV_FENCE_CIRCLE_EXCLUSION",
         "NAV_RALLY_POINT",
     )
+)
+
+POSITION_COMMANDS = _EXPLICIT_POSITION_COMMANDS | frozenset(
+    cmd for cmd, e in mavlink.enums["MAV_CMD"].items()
+    if e.has_location or e.param.get(5) == "Latitude" or e.param.get(6) == "Longitude"
 )
 
 GLOBAL_FRAMES = frozenset(
@@ -177,8 +182,9 @@ def repack(msg, mav):
     return msg.pack(mav, force_mavlink1=v1)
 
 
-_XY_IGNORE = (mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
-              | mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE)
+_XYZ_IGNORE = (mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
+               | mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE
+               | mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE)
 
 
 def _unset(a, b):
@@ -259,9 +265,10 @@ class Rewriter:
             self._track(msg)
         if kind == "convert":
             lat_f, lon_f, scale = CONVERT[name]
-            if name == "SET_POSITION_TARGET_GLOBAL_INT" and msg.type_mask & _XY_IGNORE == _XY_IGNORE:
+            if (not to_fake and name == "SET_POSITION_TARGET_GLOBAL_INT"
+                    and msg.type_mask & _XYZ_IGNORE == _XYZ_IGNORE):
                 return bytes(msg.get_msgbuf())
-            if _unset(getattr(msg, lat_f), getattr(msg, lon_f)):
+            if to_fake and _unset(getattr(msg, lat_f), getattr(msg, lon_f)):
                 return bytes(msg.get_msgbuf())
         else:
             action = self._command_action(msg)

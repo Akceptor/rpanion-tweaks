@@ -28,6 +28,16 @@ def has_big_byte_array(cls):
 
 
 class PolicyTest(unittest.TestCase):
+    def test_position_commands_cover_dialect(self):
+        want = {
+            cmd for cmd, e in mavlink.enums["MAV_CMD"].items()
+            if e.has_location or e.param.get(5) == "Latitude" or e.param.get(6) == "Longitude"
+        }
+        self.assertGreaterEqual(len(want), 40)
+        self.assertTrue(want <= lima.POSITION_COMMANDS)
+        for n in ("DO_ORBIT", "EXTERNAL_POSITION_ESTIMATE", "NAV_FOLLOW", "OVERRIDE_GOTO"):
+            self.assertIn(getattr(mavlink, "MAV_CMD_" + n), lima.POSITION_COMMANDS)
+
     def test_no_position_message_passes(self):
         for name, cls in dialect_messages().items():
             if carries_position(cls):
