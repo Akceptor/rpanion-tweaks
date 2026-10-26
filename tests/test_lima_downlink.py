@@ -100,12 +100,14 @@ class DownlinkTest(unittest.TestCase):
         speed = item_int(mavlink.MAV_CMD_DO_CHANGE_SPEED, 0, 0)
         data = frame(speed)
         self.assertEqual(rw.downlink(data), [data])
-        other = item_int(mavlink.MAV_CMD_DO_JUMP, *REAL)
-        self.assertEqual(rw.downlink(frame(other)), [])
+        other = frame(item_int(mavlink.MAV_CMD_DO_JUMP, *REAL))
+        self.assertEqual(rw.downlink(other), [other])
+        self.assertNotIn(65000, mavlink.enums["MAV_CMD"])
+        self.assertEqual(rw.downlink(frame(item_int(65000, *REAL))), [])
 
-    def test_mission_item_int_local_frame_and_no_anchor(self):
+    def test_mission_item_int_local_frame_dropped_and_no_anchor(self):
         local = frame(item_int(mavlink.MAV_CMD_NAV_WAYPOINT, 1, 2, mavlink.MAV_FRAME_LOCAL_NED))
-        self.assertEqual(self.rewriter().downlink(local), [local])
+        self.assertEqual(self.rewriter().downlink(local), [])
         wp = frame(item_int(mavlink.MAV_CMD_NAV_WAYPOINT, *REAL))
         self.assertEqual(self.rewriter().downlink(wp), [])
 
@@ -120,6 +122,50 @@ class DownlinkTest(unittest.TestCase):
             1, 1, mavlink.MAV_CMD_DO_REPOSITION, 0, 0, 0, 0, 0, REAL[0], REAL[1], 10.0)
         out = decode(b"".join(rw.downlink(frame(cmd))))[0]
         self.assertLess(lima.distance_m(out.param5, out.param6, *FAKE), 1)
+
+    def test_mission_frame_converted_and_local_dropped(self):
+        rw = self.anchored()
+        out = decode(b"".join(rw.downlink(frame(
+            item_int(mavlink.MAV_CMD_NAV_WAYPOINT, *REAL, mavlink.MAV_FRAME_MISSION)))))
+        self.assertLess(lima.distance_m(out[0].x / 1e7, out[0].y / 1e7, *FAKE), 1)
+        cmd = lambda fr: mavlink.MAVLink_command_int_message(
+            1, 1, fr, mavlink.MAV_CMD_DO_REPOSITION, 0, 0, 0, 0, 0, 0,
+            round(REAL[0] * 1e7), round(REAL[1] * 1e7), 10.0)
+        out = decode(b"".join(rw.downlink(frame(cmd(mavlink.MAV_FRAME_MISSION)))))
+        self.assertLess(lima.distance_m(out[0].x / 1e7, out[0].y / 1e7, *FAKE), 1)
+        self.assertEqual(rw.downlink(frame(cmd(mavlink.MAV_FRAME_LOCAL_NED))), [])
+
+    def test_unset_markers_untouched_down(self):
+        rw = self.anchored()
+        m = lima.INT32_MAX
+        for msg in (
+            mavlink.MAVLink_command_int_message(
+                1, 1, mavlink.MAV_FRAME_GLOBAL, mavlink.MAV_CMD_DO_REPOSITION,
+                0, 0, 0, 0, 0, 0, m, m, 10.0),
+            mavlink.MAVLink_command_long_message(
+                1, 1, mavlink.MAV_CMD_DO_REPOSITION, 0, 0, 0, 0, 0,
+                float("nan"), float("nan"), 10.0),
+        ):
+            data = frame(msg)
+            self.assertEqual(rw.downlink(data), [data], msg.get_type())
+
+    def test_adsb_dropped_down(self):
+        self.assertEqual(lima.classify("down", "ADSB_VEHICLE"), "drop")
+        rw = self.anchored()
+        msg = mavlink.MAVLink_adsb_vehicle_message(
+            1, round(REAL[0] * 1e7), round(REAL[1] * 1e7), 0, 0, 0, 0, 0, b"CALL", 0, 0, 0, 0)
+        self.assertEqual(rw.downlink(frame(msg)), [])
+
+    def test_protocol_version_passes_down(self):
+        self.assertEqual(lima.classify("down", "PROTOCOL_VERSION"), "pass")
+
+    def test_changed_fake_anchor_rebuilds_stored(self):
+        self.store.save(lima.Anchor(1.0, 2.0, -11.0, -76.0))
+        rw = self.rewriter()
+        self.assertEqual((rw.anchor.real_lat, rw.anchor.real_lon), (1.0, 2.0))
+        self.assertEqual((rw.anchor.fake_lat, rw.anchor.fake_lon), FAKE)
+        saved = self.store.load()
+        self.assertEqual((saved.real_lat, saved.fake_lat, saved.fake_lon), (1.0, *FAKE))
 
     def test_zero_latlon_untouched(self):
         rw = self.anchored()

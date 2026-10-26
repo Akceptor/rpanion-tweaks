@@ -33,8 +33,12 @@ class PolicyTest(unittest.TestCase):
             cmd for cmd, e in mavlink.enums["MAV_CMD"].items()
             if e.has_location or e.param.get(5) == "Latitude" or e.param.get(6) == "Longitude"
         }
+        local = {mavlink.MAV_CMD_NAV_LAND_LOCAL, mavlink.MAV_CMD_NAV_TAKEOFF_LOCAL}
+        self.assertTrue(local <= want)
+        want -= local
         self.assertGreaterEqual(len(want), 40)
         self.assertTrue(want <= lima.POSITION_COMMANDS)
+        self.assertFalse(local & lima.POSITION_COMMANDS)
         for n in ("DO_ORBIT", "EXTERNAL_POSITION_ESTIMATE", "NAV_FOLLOW", "OVERRIDE_GOTO"):
             self.assertIn(getattr(mavlink, "MAV_CMD_" + n), lima.POSITION_COMMANDS)
 

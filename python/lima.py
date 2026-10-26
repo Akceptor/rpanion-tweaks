@@ -94,7 +94,6 @@ CONVERT = {
     "AHRS3": ("lat", "lng", 1e7),
     "FENCE_POINT": ("lat", "lng", 1.0),
     "RALLY_POINT": ("lat", "lng", 1e7),
-    "ADSB_VEHICLE": ("lat", "lon", 1e7),
     "HIGH_LATENCY2": ("latitude", "longitude", 1e7),
     "CAMERA_FEEDBACK": ("lat", "lng", 1e7),
     "GLOBAL_POSITION_INT_COV": ("lat", "lon", 1e7),
@@ -117,10 +116,16 @@ _EXPLICIT_POSITION_COMMANDS = frozenset(
     )
 )
 
-POSITION_COMMANDS = _EXPLICIT_POSITION_COMMANDS | frozenset(
+_LOCAL_XY_COMMANDS = frozenset((
+    mavlink.MAV_CMD_NAV_LAND_LOCAL, mavlink.MAV_CMD_NAV_TAKEOFF_LOCAL,
+))
+
+POSITION_COMMANDS = (_EXPLICIT_POSITION_COMMANDS | frozenset(
     cmd for cmd, e in mavlink.enums["MAV_CMD"].items()
     if e.has_location or e.param.get(5) == "Latitude" or e.param.get(6) == "Longitude"
-)
+)) - _LOCAL_XY_COMMANDS
+
+KNOWN_COMMANDS = frozenset(mavlink.enums["MAV_CMD"])
 
 GLOBAL_FRAMES = frozenset(
     getattr(mavlink, "MAV_FRAME_" + n) for n in (
@@ -130,7 +135,7 @@ GLOBAL_FRAMES = frozenset(
 )
 
 _PASS_BOTH = frozenset("""
-HEARTBEAT SYS_STATUS SYSTEM_TIME TIMESYNC PING STATUSTEXT COMMAND_ACK
+PROTOCOL_VERSION HEARTBEAT SYS_STATUS SYSTEM_TIME TIMESYNC PING STATUSTEXT COMMAND_ACK
 PARAM_REQUEST_LIST PARAM_REQUEST_READ PARAM_SET PARAM_VALUE
 MISSION_COUNT MISSION_REQUEST MISSION_REQUEST_INT MISSION_ACK MISSION_CURRENT
 MISSION_ITEM_REACHED MISSION_CLEAR_ALL MISSION_REQUEST_LIST MISSION_SET_CURRENT
@@ -203,6 +208,11 @@ class Rewriter:
         self.fake_anchor = fake_anchor
         self.max_target_m = max_target_m
         self.anchor = store.load()
+        if self.anchor is not None and (
+                abs(self.anchor.fake_lat - fake_anchor[0]) > 1e-7
+                or abs(self.anchor.fake_lon - fake_anchor[1]) > 1e-7):
+            self.anchor = Anchor(self.anchor.real_lat, self.anchor.real_lon, *fake_anchor)
+            store.save(self.anchor)
         self.real_pos = None
         self._parsers = {
             d: mavlink.MAVLink(None) for d in ("down", "up")
@@ -280,6 +290,8 @@ class Rewriter:
             if action == "pass":
                 return bytes(msg.get_msgbuf())
             if action == "drop":
+                if not to_fake:
+                    self._warn(name, "unsupported")
                 return None
             lat_f, lon_f, scale = self._command_fields(msg)
         if self.anchor is None:
@@ -337,16 +349,21 @@ class Rewriter:
     def _command_action(cls, msg):
         name = msg.get_type()
         lat_f, lon_f, _ = cls._command_fields(msg)
-        is_pos = msg.command in POSITION_COMMANDS
-        if name == "COMMAND_LONG":
-            if not is_pos or _unset(getattr(msg, lat_f), getattr(msg, lon_f)):
-                return "pass"
-            return "convert"
-        if msg.frame not in GLOBAL_FRAMES:
+        x, y = getattr(msg, lat_f), getattr(msg, lon_f)
+        if name in ("COMMAND_LONG", "MISSION_ITEM"):
+            unset = all(v == 0 or math.isnan(v) for v in (x, y))
+        else:
+            unset = _unset(x, y)
+        if unset:
             return "pass"
-        if getattr(msg, lat_f) == 0 and getattr(msg, lon_f) == 0:
+        frame = getattr(msg, "frame", None)
+        # COMMAND_LONG has no frame; its params 5/6 are global for position commands
+        global_like = frame is None or frame in GLOBAL_FRAMES or frame == mavlink.MAV_FRAME_MISSION
+        if msg.command in POSITION_COMMANDS:
+            return "convert" if global_like else "drop"
+        if msg.command in KNOWN_COMMANDS:
             return "pass"
-        return "convert" if is_pos else "drop"
+        return "drop" if global_like else "pass"
 
 
 def parse_hostport(s):
