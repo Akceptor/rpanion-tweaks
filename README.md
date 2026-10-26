@@ -94,16 +94,29 @@ INA226   VCC ──▶ pin 1  (3.3V)
 - Keep SDA/SCL short (under ~20 cm) and away from ESC/motor wires.
 - Swap the shunt first (see below), then check with `i2cdetect` before closing the airframe.
 
-Enable I2C, give the service user access and check that the sensor is seen (`0x40` by default):
+**Set up I2C on the Pi.** The overlay reads `/dev/i2c-N` directly and needs no Python packages. `i2c-tools` (`i2cdetect`, `i2cget`) is only for checking the wiring.
 
-```bash
-sudo raspi-config nonint do_i2c 0
-sudo usermod -aG i2c rpanion
-sudo apt install i2c-tools
-i2cdetect -y 1
-```
+1. Install the tools, enable I2C, give the service user access, then reboot:
 
-Log out/in or restart `rpanion-server` after the group change.
+   ```bash
+   sudo apt update
+   sudo apt install -y i2c-tools
+   sudo raspi-config nonint do_i2c 0      # 0 = enable
+   sudo usermod -aG i2c rpanion
+   sudo reboot
+   ```
+
+2. After the reboot, check that the bus exists and the sensor answers (`0x40` by default):
+
+   ```bash
+   ls -l /dev/i2c-1                          # missing = I2C still off
+   i2cdetect -y 1                            # expect "40" in the grid
+   sudo -u rpanion i2cget -y 1 0x40 0x02 w   # bus voltage register; an error here means the service can't read it either
+   ```
+
+   An empty grid means a wiring or power problem: check VCC on pin 1 (3.3V), GND on pin 6, and that SDA/SCL aren't swapped. If the sensor shows up as `41`, `44` or `45`, A0/A1 are strapped, so set `INA226_ADDR` to match.
+
+The overlay hides the `PI` line on any I2C error without logging it, so run these checks first if it doesn't show.
 
 **Replace the shunt resistor.** Most modules ship with R100 (0.1 Ω). The INA226 maxes out at 81.92 mV across the shunt, so that is only ~0.82 A, while a Pi 5 plus a modem on 2S draws about 1.3 A. Swap it for R010 (0.01 Ω, ~8 A range) and set `INA226_SHUNT_OHMS=0.01`. When the reading is clipped, the overlay shows `0.8A+` instead of a wrong number.
 
