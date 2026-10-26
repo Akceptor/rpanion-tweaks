@@ -50,7 +50,7 @@ class AnchorStore:
             with open(self.path) as f:
                 d = json.load(f)
             vals = [float(d[k]) for k in ("real_lat", "real_lon", "fake_lat", "fake_lon")]
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
             return None
         if not all(math.isfinite(v) for v in vals):
             return None

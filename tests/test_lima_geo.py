@@ -85,6 +85,12 @@ class StoreTest(unittest.TestCase):
             with open(self.path, "w") as f:
                 json.dump(d, f)
             self.assertIsNone(store.load(), d)
+        with open(self.path, "w") as f:
+            f.write('{"real_lat": 1' + "0" * 400 + "}")
+        self.assertIsNone(store.load())
+        with open(self.path, "w") as f:
+            f.write("[" * 100000)
+        self.assertIsNone(store.load())
 
 
 if __name__ == "__main__":
