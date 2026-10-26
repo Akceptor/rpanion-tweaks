@@ -80,12 +80,12 @@ In Rpanion's Flight Controller page the user removes the direct GCS output, adds
 
 The builder must cover at least these, and must make the drop rule hold for anything not listed.
 
-Downlink (FC → GCS), convert: `GLOBAL_POSITION_INT`, `GPS_RAW_INT`, `GPS2_RAW`, `HOME_POSITION`, `GPS_GLOBAL_ORIGIN`, `MISSION_ITEM_INT` / `MISSION_ITEM` (mission, fence and rally download), `POSITION_TARGET_GLOBAL_INT`, `AHRS2`, `AHRS3`, `FENCE_POINT`, `RALLY_POINT`, `ADSB_VEHICLE` (nearby real traffic would give away the area), `HIGH_LATENCY2`, `CAMERA_FEEDBACK`, `GLOBAL_POSITION_INT_COV`, `TERRAIN_REQUEST`, `TERRAIN_REPORT`, `SIMSTATE` / `SIM_STATE` (SITL testing).
+Downlink (FC → GCS), convert: `GLOBAL_POSITION_INT`, `GPS_RAW_INT`, `GPS2_RAW`, `HOME_POSITION`, `GPS_GLOBAL_ORIGIN`, `MISSION_ITEM_INT` / `MISSION_ITEM` (mission, fence and rally download), `POSITION_TARGET_GLOBAL_INT`, `AHRS2`, `AHRS3`, `FENCE_POINT`, `RALLY_POINT`, `HIGH_LATENCY2`, `CAMERA_FEEDBACK`, `GLOBAL_POSITION_INT_COV`, `TERRAIN_REQUEST`, `TERRAIN_REPORT`, `SIMSTATE` / `SIM_STATE` (SITL testing).
 
 Uplink (GCS → FC), convert back and guard: `MISSION_ITEM_INT` / `MISSION_ITEM`, `SET_POSITION_TARGET_GLOBAL_INT`, `COMMAND_INT`, `COMMAND_LONG` (only commands whose params 5/6 are lat/lon, e.g. `DO_SET_HOME`, `DO_SET_ROI_LOCATION`, `NAV_*`), `SET_HOME_POSITION`, `SET_GPS_GLOBAL_ORIGIN`, `FENCE_POINT`, `RALLY_POINT`.
 
 Rules that matter:
-- Convert only coordinates that really are global lat/lon. Check the frame (global vs local/mission frames) and the command (many `MAV_CMD_DO_*` use x/y or params 5/6 for other things).
+- Convert only coordinates that really are global lat/lon. Check the frame (global and `MAV_FRAME_MISSION` convert; a position command in any other frame is dropped) and the command (a command the dialect knows that is not a position command passes untouched; an unknown command with x/y set is dropped) (many `MAV_CMD_DO_*` use x/y or params 5/6 for other things).
 - Leave special values alone: `0,0` ("not set / use current") and `INT32_MAX` "unknown" markers.
 - Integer `1e7` degrees and float degrees both appear. Round-trip error: at most 1 cm on integer fields, at most 1 m on float-degree fields (`MISSION_ITEM`, `COMMAND_LONG` params 5/6, `FENCE_POINT`). A float32 can't do better at these longitudes, and 1 m is below rover GPS error. My call; keep converting both forms.
 - Recompute CRCs. MAVLink1 and MAVLink2 both possible.
@@ -99,6 +99,7 @@ Messages with opaque byte payloads (my calls, all following "fail closed"):
 | `SERIAL_CONTROL` (MAVLink console) | both | drop | No MAVLink console through Lima |
 | `GPS_RTCM_DATA`, `GPS_INJECT_DATA` | uplink only | pass | RTK corrections from the GCS still reach the FC. Never shown on screen |
 | `FOLLOW_TARGET` | both | drop | No GCS follow-me |
+| `ADSB_VEHICLE` | both | drop | No nearby traffic on the map; position and callsign would give away the area |
 
 Not hidden by Lima (README must warn): the GCS's own location. QGC and Mission Planner can show the PC's own position on the map (Windows location services, a USB GPS). That has to be turned off in the GCS before streaming.
 

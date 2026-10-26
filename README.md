@@ -160,15 +160,16 @@ These carry data Lima can't safely convert, so they don't pass:
 | Log download (`LOG_ENTRY`, `LOG_DATA`, requests) | Use the Rpanion web UI logs instead |
 | MAVLink console (`SERIAL_CONTROL`) | Not available through Lima |
 | Follow-me (`FOLLOW_TARGET`) | Not available |
+| ADS-B traffic (`ADSB_VEHICLE`) | No nearby traffic shown on the map (its position and callsign would give away the area) |
 
 RTK corrections from the GCS (`GPS_RTCM_DATA`) still reach the FC.
 
-### Install
+### Install Lima
 
 `pymavlink` comes with the Rpanion `.deb` for user `rpanion`. Check:
 
 ```bash
-sudo -u rpanion python3 -c "import pymavlink"
+sudo -u rpanion python3 -c "from pymavlink.dialects.v20 import ardupilotmega as m; m.enums['MAV_CMD'][16].has_location"
 ```
 
 On the Pi:
@@ -179,13 +180,13 @@ sudo wget -O /usr/local/lib/lima/lima.py https://raw.githubusercontent.com/Akcep
 sudo wget -O /etc/systemd/system/lima.service https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/systemd/lima.service
 sudo chown root:root /usr/local/lib/lima/lima.py
 sudo chmod 644 /usr/local/lib/lima/lima.py
+sudo systemctl daemon-reload
 
 sudo systemctl edit lima
 # add:
 # [Service]
 # Environment=LIMA_GCS=<pc-zerotier-ip>:14550
 
-sudo systemctl daemon-reload
 sudo systemctl enable --now lima
 ```
 
@@ -219,6 +220,8 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
 | `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
 | `LIMA_MAX_TARGET_KM` | `5` | Uplink guard: drop GCS targets farther than this from the rover |
+
+Changing `LIMA_FAKE_ANCHOR` takes effect on the next Lima restart. The real-side anchor only resets on a Pi reboot, so reboot the Pi when moving to a new site.
 
 ### Revert
 
