@@ -121,6 +121,113 @@ Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then ad
 
 The Pi battery % is a voltage estimate. It sags under load, so expect it to read low while the modem is busy. The table is for LiPo; Li-ion packs will read low.
 
+## Lima (fake position on the GCS map)
+
+`python/lima.py` is a MAVLink proxy that sits on the GCS link only. The ground station (QGC, Mission Planner) shows the rover in Lima, Peru, moving exactly as it really moves. Commands from the GCS (missions, "drive here", set home, fences) are shifted back, so the rover drives where you meant.
+
+```
+FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (real)
+                      └─ 127.0.0.1:14580 ─ Lima ─ UDP ─ GCS PC       (fake)
+```
+
+- The rover's first good GPS fix (3D or better) after Lima starts maps to the Lima point. No reference point to set.
+- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one.
+- The shift is in metres, so distances and headings on the map match reality. Altitude is unchanged.
+- Fails closed: a crash, a missing setting, or a message with a position Lima can't convert means the GCS gets nothing, never the real value.
+- After converting a GCS target back, anything more than `LIMA_MAX_TARGET_KM` from the rover is dropped and the GCS gets a `STATUSTEXT` warning.
+- MAVLink2 signing must be off (the ArduPilot default), because rewriting breaks signatures.
+
+### What it doesn't hide
+
+- Logs (Rpanion DataFlash logger, FC SD card), NTRIP, cloud upload, the Rpanion web UI: all stay real.
+- The camera image.
+- **The GCS's own location.** Turn off Windows location services and any USB GPS in QGC/Mission Planner before streaming, or the PC's real position shows on the map.
+- Any GCS connection that bypasses Lima (Rpanion TCP server `5760`, UDP server, direct GCS UDP output). The setup below turns these off; Lima doesn't police them.
+
+### Saved missions shift
+
+The anchor lives in `/run/lima/` (tmpfs), so it is cleared when the Pi reboots and a new one is taken at the next first fix. A mission saved in the GCS and loaded after a Pi reboot lands shifted by the distance between the two start points. Only the `LIMA_MAX_TARGET_KM` guard catches it, and only for big shifts. Missions stored on the FC are fine (converted fresh on each download).
+
+If Lima alone restarts, it reuses the anchor and the icon doesn't jump.
+
+### What's dropped
+
+These carry data Lima can't safely convert, so they don't pass:
+
+| Feature | Effect |
+|---|---|
+| MAVFTP (`FILE_TRANSFER_PROTOCOL`) | GCS falls back to the normal parameter/mission protocols. QGC parameter load is slower; Lua script upload through the GCS doesn't work |
+| Log download (`LOG_ENTRY`, `LOG_DATA`, requests) | Use the Rpanion web UI logs instead |
+| MAVLink console (`SERIAL_CONTROL`) | Not available through Lima |
+| Follow-me (`FOLLOW_TARGET`) | Not available |
+
+RTK corrections from the GCS (`GPS_RTCM_DATA`) still reach the FC.
+
+### Install
+
+`pymavlink` comes with the Rpanion `.deb` for user `rpanion`. Check:
+
+```bash
+sudo -u rpanion python3 -c "import pymavlink"
+```
+
+On the Pi:
+
+```bash
+sudo mkdir -p /usr/local/lib/lima
+sudo wget -O /usr/local/lib/lima/lima.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/lima.py
+sudo wget -O /etc/systemd/system/lima.service https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/systemd/lima.service
+sudo chown root:root /usr/local/lib/lima/lima.py
+sudo chmod 644 /usr/local/lib/lima/lima.py
+
+sudo systemctl edit lima
+# add:
+# [Service]
+# Environment=LIMA_GCS=<pc-zerotier-ip>:14550
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now lima
+```
+
+`LIMA_GCS` is required. QGC and Mission Planner listen on UDP 14550 by default. Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
+
+Then in Rpanion's web UI, **Flight Controller** page (stop telemetry first):
+
+1. Remove the direct GCS UDP output.
+2. **Telemetry Destinations** → **UDP Client** → add `127.0.0.1:14580`.
+3. Turn the **TCP server** and **UDP server** off.
+4. Keep `127.0.0.1:14570` (the HUD) and `127.0.0.1:14540`.
+5. Start telemetry.
+
+### Check
+
+```bash
+systemctl status lima
+journalctl -u lima -f
+```
+
+- With the rover having a GPS fix, the journal shows `Lima: anchor set` (or `Lima: anchor loaded` after a Lima restart), and QGC shows the rover in Lima.
+- `systemctl status lima` showing exit code 2 means a setting is missing or invalid (see `journalctl -u lima`). The service doesn't restart-loop in that case.
+
+### Settings
+
+Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines under `[Service]`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LIMA_GCS` | none, required | `ip:port` of the GCS, e.g. the PC's ZeroTier IP and `14550` |
+| `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
+| `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
+| `LIMA_MAX_TARGET_KM` | `5` | Uplink guard: drop GCS targets farther than this from the rover |
+
+### Revert
+
+```bash
+sudo systemctl disable --now lima
+```
+
+In the Rpanion web UI, remove `127.0.0.1:14580` and add the direct GCS UDP output back.
+
 ## Install
 
 Rpanion 0.12 from the `.deb` lives in `/usr/share/rpanion-server/app` and runs as the `rpanion-server` service.

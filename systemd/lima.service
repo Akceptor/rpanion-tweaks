@@ -10,6 +10,7 @@ RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=2
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=multi-user.target
