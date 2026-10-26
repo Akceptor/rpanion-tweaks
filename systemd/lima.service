@@ -1,0 +1,15 @@
+[Unit]
+Description=Lima MAVLink position-shifting proxy
+After=rpanion-server.service
+
+[Service]
+User=rpanion
+ExecStart=/usr/bin/python3 /usr/local/lib/lima/lima.py
+RuntimeDirectory=lima
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

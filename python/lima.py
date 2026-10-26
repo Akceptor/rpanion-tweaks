@@ -3,7 +3,12 @@ import json
 import logging
 import math
 import os
+import select
+import signal
+import socket
+import sys
 import tempfile
+import threading
 import time
 
 from pymavlink.dialects.v20 import ardupilotmega as mavlink
@@ -342,3 +347,107 @@ class Rewriter:
         if getattr(msg, lat_f) == 0 and getattr(msg, lon_f) == 0:
             return "pass"
         return "convert" if is_pos else "drop"
+
+
+def parse_hostport(s):
+    host, sep, port = s.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"expected host:port, got {s!r}")
+    return host, int(port)
+
+
+def parse_latlon(s):
+    parts = s.split(",")
+    if len(parts) != 2:
+        raise ValueError(f"expected lat,lon, got {s!r}")
+    lat, lon = float(parts[0]), float(parts[1])
+    if not (abs(lat) <= 90 and abs(lon) <= 180):
+        raise ValueError(f"lat,lon out of range: {s!r}")
+    return lat, lon
+
+
+def _log_anchor(rewriter, was_set):
+    if rewriter.anchor is not None and not was_set:
+        log.info("Lima: anchor set")
+    return rewriter.anchor is not None
+
+
+def run(listen, gcs, rewriter, stop):
+    gcs_ip = socket.gethostbyname(gcs[0])
+    from_router = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    from_gcs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        from_router.bind(listen)
+        from_gcs.bind(("0.0.0.0", 0))
+        router_addr = None
+        anchored = rewriter.anchor is not None
+        if anchored:
+            log.info("Lima: anchor loaded")
+        while not stop.is_set():
+            ready, _, _ = select.select([from_router, from_gcs], [], [], 0.5)
+            for sock in ready:
+                # On Linux an ICMP port-unreachable from an earlier sendto makes the next
+                # recvfrom raise ConnectionRefusedError; a GCS that is off must not kill us.
+                try:
+                    data, addr = sock.recvfrom(65535)
+                except OSError:
+                    continue
+                if sock is from_router:
+                    router_addr = addr
+                    for pkt in rewriter.downlink(data):
+                        _send(from_gcs, pkt, gcs)
+                    anchored = _log_anchor(rewriter, anchored)
+                else:
+                    if addr[0] != gcs_ip:
+                        continue
+                    for pkt in rewriter.uplink(data):
+                        if router_addr is not None:
+                            _send(from_router, pkt, router_addr)
+                    for w in rewriter.take_warnings():
+                        _send(from_gcs, w, gcs)
+    finally:
+        from_router.close()
+        from_gcs.close()
+
+
+def _send(sock, data, dest):
+    try:
+        sock.sendto(data, dest)
+    except OSError:
+        pass
+
+
+def _setting(name, default, parse):
+    raw = os.environ.get(name, default)
+    try:
+        if raw is None:
+            raise ValueError("required")
+        return parse(raw)
+    except ValueError as e:
+        print(f"Lima: invalid {name}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _parse_km(s):
+    km = float(s)
+    if not 0 <= km < float("inf"):
+        raise ValueError(f"expected a non-negative number, got {s!r}")
+    return km
+
+
+def main():
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
+    gcs = _setting("LIMA_GCS", None, parse_hostport)
+    listen = _setting("LIMA_LISTEN", "127.0.0.1:14580", parse_hostport)
+    fake_anchor = _setting("LIMA_FAKE_ANCHOR", "-12.0700,-77.0435", parse_latlon)
+    max_km = _setting("LIMA_MAX_TARGET_KM", "5", _parse_km)
+    store = AnchorStore(os.environ.get("LIMA_ANCHOR_FILE", "/run/lima/anchor.json"))
+    rewriter = Rewriter(store, fake_anchor, max_km * 1000)
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    run(listen, gcs, rewriter, stop)
+
+
+if __name__ == "__main__":
+    main()
