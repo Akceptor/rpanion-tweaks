@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import logging
 import math
 import os
 import tempfile
@@ -48,12 +49,14 @@ class AnchorStore:
         try:
             with open(self.path) as f:
                 d = json.load(f)
-            return Anchor(
-                float(d["real_lat"]), float(d["real_lon"]),
-                float(d["fake_lat"]), float(d["fake_lon"]),
-            )
+            vals = [float(d[k]) for k in ("real_lat", "real_lon", "fake_lat", "fake_lon")]
         except (OSError, ValueError, KeyError, TypeError):
             return None
+        if not all(math.isfinite(v) for v in vals):
+            return None
+        if abs(vals[0]) > 90 or abs(vals[2]) > 90 or abs(vals[1]) > 180 or abs(vals[3]) > 180:
+            return None
+        return Anchor(*vals)
 
     def save(self, anchor):
         d = os.path.dirname(self.path) or "."
@@ -157,3 +160,131 @@ def classify(direction, name):
     if name in (PASS_DOWN if direction == "down" else PASS_UP):
         return "pass"
     return "drop"
+
+
+log = logging.getLogger("lima")
+
+INT32_MAX = 2147483647
+
+
+def repack(msg, mav):
+    # pack() takes seq and the source ids from the MAVLink object, not from msg
+    mav.seq = msg.get_seq()
+    mav.srcSystem = msg.get_srcSystem()
+    mav.srcComponent = msg.get_srcComponent()
+    v1 = msg.get_msgbuf()[0] == 0xFE
+    return msg.pack(mav, force_mavlink1=v1)
+
+
+def _unset(a, b):
+    return a in (0, INT32_MAX) and b in (0, INT32_MAX)
+
+
+class Rewriter:
+    def __init__(self, store, fake_anchor, max_target_m):
+        self.store = store
+        self.fake_anchor = fake_anchor
+        self.max_target_m = max_target_m
+        self.anchor = store.load()
+        self.real_pos = None
+        self._parsers = {
+            d: mavlink.MAVLink(None) for d in ("down", "up")
+        }
+        for p in self._parsers.values():
+            p.robust_parsing = True
+        self._out = mavlink.MAVLink(None)
+        self._logged = set()
+
+    def downlink(self, datagram):
+        return self._process("down", datagram, True)
+
+    def _process(self, direction, datagram, to_fake):
+        out = []
+        for msg in self._parsers[direction].parse_buffer(datagram) or []:
+            if msg.get_type() == "BAD_DATA":
+                continue
+            try:
+                data = self._handle(direction, msg, to_fake)
+            except Exception:
+                name = msg.get_type()
+                if name not in self._logged:
+                    self._logged.add(name)
+                    log.exception("dropping %s", name)
+                data = None
+            if data is not None:
+                out.append(data)
+        return out
+
+    def _handle(self, direction, msg, to_fake):
+        name = msg.get_type()
+        kind = classify(direction, name)
+        if kind == "pass":
+            return bytes(msg.get_msgbuf())
+        if kind == "drop":
+            return None
+        if direction == "down":
+            self._track(msg)
+        if kind == "convert":
+            lat_f, lon_f, scale = CONVERT[name]
+            if _unset(getattr(msg, lat_f), getattr(msg, lon_f)):
+                return bytes(msg.get_msgbuf())
+        else:
+            action = self._command_action(msg)
+            if action == "pass":
+                return bytes(msg.get_msgbuf())
+            if action == "drop":
+                return None
+            lat_f, lon_f, scale = self._command_fields(msg)
+        if self.anchor is None:
+            return None
+        convert = self.anchor.to_fake if to_fake else self.anchor.to_real
+        lat = getattr(msg, lat_f) / scale
+        lon = getattr(msg, lon_f) / scale
+        lat, lon = convert(lat, lon)
+        if scale == 1.0:
+            setattr(msg, lat_f, lat)
+            setattr(msg, lon_f, lon)
+        else:
+            setattr(msg, lat_f, round(lat * scale))
+            setattr(msg, lon_f, round(lon * scale))
+        return repack(msg, self._out)
+
+    def _track(self, msg):
+        name = msg.get_type()
+        if name == "GLOBAL_POSITION_INT":
+            ok = msg.lat != 0 or msg.lon != 0
+        elif name == "GPS_RAW_INT":
+            ok = msg.fix_type >= 3 and (msg.lat != 0 or msg.lon != 0)
+        else:
+            return
+        if not ok:
+            return
+        lat, lon = msg.lat / 1e7, msg.lon / 1e7
+        self.real_pos = (lat, lon)
+        if name == "GPS_RAW_INT" and self.anchor is None:
+            self.anchor = Anchor(lat, lon, *self.fake_anchor)
+            self.store.save(self.anchor)
+
+    @staticmethod
+    def _command_fields(msg):
+        name = msg.get_type()
+        if name == "COMMAND_LONG":
+            return "param5", "param6", 1.0
+        if name == "MISSION_ITEM":
+            return "x", "y", 1.0
+        return "x", "y", 1e7
+
+    @classmethod
+    def _command_action(cls, msg):
+        name = msg.get_type()
+        lat_f, lon_f, _ = cls._command_fields(msg)
+        is_pos = msg.command in POSITION_COMMANDS
+        if name == "COMMAND_LONG":
+            if not is_pos or _unset(getattr(msg, lat_f), getattr(msg, lon_f)):
+                return "pass"
+            return "convert"
+        if msg.frame not in GLOBAL_FRAMES:
+            return "pass"
+        if getattr(msg, lat_f) == 0 and getattr(msg, lon_f) == 0:
+            return "pass"
+        return "convert" if is_pos else "drop"

@@ -1,4 +1,5 @@
 import math
+import json
 import os
 import stat
 import tempfile
@@ -73,6 +74,17 @@ class StoreTest(unittest.TestCase):
         with open(self.path, "w") as f:
             f.write("{")
         self.assertIsNone(store.load())
+        good = {"real_lat": 47.0, "real_lon": 8.0, "fake_lat": -12.07, "fake_lon": -77.0435}
+        bad = [
+            [], {}, "x", {**good, "real_lat": "a"}, {**good, "real_lat": None},
+            {**good, "real_lat": float("nan")}, {**good, "fake_lon": float("inf")},
+            {**good, "real_lat": 90.5}, {**good, "fake_lat": -91}, {**good, "real_lon": 181},
+            {**good, "fake_lon": -180.5},
+        ]
+        for d in bad:
+            with open(self.path, "w") as f:
+                json.dump(d, f)
+            self.assertIsNone(store.load(), d)
 
 
 if __name__ == "__main__":
