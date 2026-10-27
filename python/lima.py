@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ipaddress
 import json
 import logging
 import math
@@ -389,19 +390,30 @@ def _log_anchor(rewriter, was_set):
     return rewriter.anchor is not None
 
 
-def run(listen, gcs, rewriter, stop):
-    gcs_ip = socket.gethostbyname(gcs[0])
+PEER_TIMEOUT = 5.0
+
+
+def parse_ip_list(s):
+    return {str(ipaddress.IPv4Address(part.strip())) for part in s.split(",")}
+
+
+def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic):
     from_router = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     from_gcs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         from_router.bind(listen)
-        from_gcs.bind(("0.0.0.0", 0))
+        from_gcs.bind(serve)
         router_addr = None
+        peer = None
+        peer_seen = 0.0
         anchored = rewriter.anchor is not None
         if anchored:
             log.info("Lima: anchor loaded")
         while not stop.is_set():
             ready, _, _ = select.select([from_router, from_gcs], [], [], 0.5)
+            if peer is not None and clock() - peer_seen > PEER_TIMEOUT:
+                log.info("Lima: GCS timed out")
+                peer = None
             for sock in ready:
                 # On Linux an ICMP port-unreachable from an earlier sendto makes the next
                 # recvfrom raise ConnectionRefusedError; a GCS that is off must not kill us.
@@ -412,16 +424,25 @@ def run(listen, gcs, rewriter, stop):
                 if sock is from_router:
                     router_addr = addr
                     for pkt in rewriter.downlink(data):
-                        _send(from_gcs, pkt, gcs)
+                        if peer is not None:
+                            _send(from_gcs, pkt, peer)
                     anchored = _log_anchor(rewriter, anchored)
                 else:
-                    if addr[0] != gcs_ip:
+                    if allow is not None and addr[0] not in allow:
                         continue
-                    for pkt in rewriter.uplink(data):
+                    out = rewriter.uplink(data)
+                    warnings = rewriter.take_warnings()
+                    if not (out or warnings):
+                        continue
+                    if addr != peer:
+                        log.info("Lima: GCS connected %s:%d", *addr)
+                    peer = addr
+                    peer_seen = clock()
+                    for pkt in out:
                         if router_addr is not None:
                             _send(from_router, pkt, router_addr)
-                    for w in rewriter.take_warnings():
-                        _send(from_gcs, w, gcs)
+                    for w in warnings:
+                        _send(from_gcs, w, peer)
     finally:
         from_router.close()
         from_gcs.close()
@@ -454,7 +475,8 @@ def _parse_km(s):
 
 def main():
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
-    gcs = _setting("LIMA_GCS", None, parse_hostport)
+    serve = _setting("LIMA_SERVE", "0.0.0.0:14550", parse_hostport)
+    allow = _setting("LIMA_GCS_ALLOW", None, parse_ip_list) if "LIMA_GCS_ALLOW" in os.environ else None
     listen = _setting("LIMA_LISTEN", "127.0.0.1:14580", parse_hostport)
     fake_anchor = _setting("LIMA_FAKE_ANCHOR", "-12.0700,-77.0435", parse_latlon)
     max_km = _setting("LIMA_MAX_TARGET_KM", "5", _parse_km)
@@ -463,7 +485,7 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    run(listen, gcs, rewriter, stop)
+    run(listen, serve, rewriter, stop, allow=allow)
 
 
 if __name__ == "__main__":

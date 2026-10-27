@@ -182,23 +182,30 @@ sudo chown root:root /usr/local/lib/lima/lima.py
 sudo chmod 644 /usr/local/lib/lima/lima.py
 sudo systemctl daemon-reload
 
-sudo systemctl edit lima
-# add:
+# optional: only accept GCS packets from the PC's ZeroTier IP
+# sudo systemctl edit lima
 # [Service]
-# Environment=LIMA_GCS=<pc-zerotier-ip>:14550
+# Environment=LIMA_GCS_ALLOW=<pc-zerotier-ip>
 
 sudo systemctl enable --now lima
 ```
 
-`LIMA_GCS` is required. QGC and Mission Planner listen on UDP 14550 by default. Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
+Lima is a UDP server on port 14550, like Rpanion's own UDP Server. The Pi never sends to a GCS first: nothing goes out until a GCS sends Lima a packet, and the GCS must connect to the Pi (see below). Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
 
 Then in Rpanion's web UI, **Flight Controller** page (stop telemetry first):
 
 1. Remove the direct GCS UDP output.
 2. **Telemetry Destinations** → **UDP Client** → add `127.0.0.1:14580`.
-3. Turn the **TCP server** and **UDP server** off.
-4. Keep `127.0.0.1:14570` (the HUD) and `127.0.0.1:14540`.
+3. Keep `127.0.0.1:14570` (the HUD) and `127.0.0.1:14540`.
+4. Untick **Enable UDP Server** and **Enable TCP Server at port 5760**. Both bypass Lima, and the UDP server would also clash with Lima on port 14550.
 5. Start telemetry.
+
+On the GCS (the PC connects to the Pi):
+
+- QGroundControl: Application Settings → Comm Links → Add → Type UDP, add Server `<Pi ZeroTier IP>:14550` (e.g. `10.46.93.18:14550`), Connect.
+- Mission Planner: connection type UDPCI, host the Pi IP, port 14550.
+
+Since the Pi never sends first, no inbound firewall rule is needed on the PC. If the GCS goes quiet for 5 s, Lima forgets it and stops sending until the next packet arrives.
 
 ### Check
 
@@ -208,7 +215,7 @@ journalctl -u lima -f
 ```
 
 - With the rover having a GPS fix, the journal shows `Lima: anchor set` (or `Lima: anchor loaded` after a Lima restart), and QGC shows the rover in Lima.
-- `systemctl status lima` showing exit code 2 means a setting is missing or invalid (see `journalctl -u lima`). The service doesn't restart-loop in that case.
+- `systemctl status lima` showing exit code 2 means a setting is invalid (see `journalctl -u lima`). The service doesn't restart-loop in that case.
 
 ### Settings
 
@@ -216,7 +223,8 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LIMA_GCS` | none, required | `ip:port` of the GCS, e.g. the PC's ZeroTier IP and `14550` |
+| `LIMA_SERVE` | `0.0.0.0:14550` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
+| `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
 | `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
 | `LIMA_MAX_TARGET_KM` | `5` | Uplink guard: drop GCS targets farther than this from the rover |
