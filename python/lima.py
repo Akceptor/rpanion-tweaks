@@ -475,7 +475,7 @@ def _parse_km(s):
 
 def main():
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
-    serve = _setting("LIMA_SERVE", "0.0.0.0:14550", parse_hostport)
+    serve = _setting("LIMA_SERVE", "0.0.0.0:14551", parse_hostport)
     allow = _setting("LIMA_GCS_ALLOW", None, parse_ip_list) if "LIMA_GCS_ALLOW" in os.environ else None
     listen = _setting("LIMA_LISTEN", "127.0.0.1:14580", parse_hostport)
     fake_anchor = _setting("LIMA_FAKE_ANCHOR", "-12.0700,-77.0435", parse_latlon)

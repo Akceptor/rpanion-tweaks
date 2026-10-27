@@ -271,7 +271,7 @@ class MainTest(unittest.TestCase):
                 mock.patch.object(lima, "run") as run:
             lima.main()
         serve, allow = run.call_args.args[1], run.call_args.kwargs["allow"]
-        self.assertEqual(serve, ("0.0.0.0", 14550))
+        self.assertEqual(serve, ("0.0.0.0", 14551))
         self.assertIsNone(allow)
 
     def test_main_reads_serve_and_allow(self):

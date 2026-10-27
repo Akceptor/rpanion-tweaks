@@ -142,7 +142,7 @@ FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (re
 - Logs (Rpanion DataFlash logger, FC SD card), NTRIP, cloud upload, the Rpanion web UI: all stay real.
 - The camera image.
 - **The GCS's own location.** Turn off Windows location services and any USB GPS in QGC/Mission Planner before streaming, or the PC's real position shows on the map.
-- Any GCS connection that bypasses Lima (Rpanion TCP server `5760`, UDP server, direct GCS UDP output). The setup below turns these off; Lima doesn't police them.
+- Any GCS connection that bypasses Lima (Rpanion UDP server `14550`, TCP server `5760`, direct GCS UDP output). Those stay enabled in the setup below as the real stream, so Lima hides nothing if the GCS is on them. See the warning under setup.
 
 ### Saved missions shift
 
@@ -190,20 +190,28 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now lima
 ```
 
-Lima is a UDP server on port 14550, like Rpanion's own UDP Server. The Pi never sends to a GCS first: nothing goes out until a GCS sends Lima a packet, and the GCS must connect to the Pi (see below). Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
+Lima is a UDP server on port 14551, next to Rpanion's own UDP Server on 14550. The Pi never sends to a GCS first: nothing goes out until a GCS sends Lima a packet, and the GCS must connect to the Pi (see below). Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
 
 Then in Rpanion's web UI, **Flight Controller** page (stop telemetry first):
 
-1. Remove the direct GCS UDP output.
+1. Remove any direct GCS UDP output.
 2. **Telemetry Destinations** → **UDP Client** → add `127.0.0.1:14580`.
 3. Keep `127.0.0.1:14570` (the HUD) and `127.0.0.1:14540`.
-4. Untick **Enable UDP Server** and **Enable TCP Server at port 5760**. Both bypass Lima, and the UDP server would also clash with Lima on port 14550.
-5. Start telemetry.
+4. Start telemetry.
+
+Rpanion's **UDP Server** (14550) and **TCP Server** (5760) can stay enabled. They give the real, unshifted stream, so you choose per session by port.
 
 On the GCS (the PC connects to the Pi):
 
-- QGroundControl: Application Settings → Comm Links → Add → Type UDP, add Server `<Pi ZeroTier IP>:14550` (e.g. `10.46.93.18:14550`), Connect.
-- Mission Planner: connection type UDPCI, host the Pi IP, port 14550.
+| Want | Port on `<Pi IP>` (e.g. `10.46.93.18`) |
+|---|---|
+| Lima (fake position) | `14551` |
+| Real position | `14550` |
+
+- Mission Planner: connection type UDPCl, host the Pi IP, port 14551 (Lima) or 14550 (real).
+- QGroundControl: Application Settings → Comm Links → Add → Type UDP, add Server `<Pi IP>:14551`, Connect.
+
+> **Warning: Lima hides nothing if the GCS is also connected to 14550 or 5760, or connected there instead.** Connect to only one. Before sharing video or screen, confirm the map shows Lima. A GCS that auto-connects (QGC AutoConnect UDP on 14550, saved links) can pull the real stream, so check Comm Links and remove or disable those.
 
 Since the Pi never sends first, no inbound firewall rule is needed on the PC. If the GCS goes quiet for 5 s, Lima forgets it and stops sending until the next packet arrives.
 
@@ -223,7 +231,7 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LIMA_SERVE` | `0.0.0.0:14550` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
+| `LIMA_SERVE` | `0.0.0.0:14551` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
 | `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
 | `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
