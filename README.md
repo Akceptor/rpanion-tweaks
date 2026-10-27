@@ -121,6 +121,15 @@ The overlay hides the `PI` line on any I2C error without logging it, so run thes
 
 **Replace the shunt resistor.** Most modules ship with R100 (0.1 Ω). The INA226 maxes out at 81.92 mV across the shunt, so that is only ~0.82 A, while a Pi 5 plus a modem on 2S draws about 1.3 A. Swap it for R010 (0.01 Ω, ~8 A range) and set `INA226_SHUNT_OHMS=0.01`. When the reading is clipped, the overlay shows `0.8A+` instead of a wrong number.
 
+### Pi battery in Mission Planner
+
+The Pi battery is also sent to the GCS as a MAVLink `BATTERY_STATUS` with `id=1`, through mavlink-router's TCP port `5760` (Rpanion has it on by default), so there is nothing more to set up. Mission Planner shows it as battery 2 (**Quick** tab: `battery_voltage2`, `current_battery2`).
+
+- The FC must have `BATT2_MONITOR=0`, otherwise its own battery 2 clashes with this one.
+- It is only sent while FC telemetry is arriving (the server copies the FC's system id) and the TCP connection is up (retried every 10 s).
+- It is sent by the video server, so the video stream has to be started in Rpanion (no viewer needed).
+- It is sent as the autopilot (1/1) because Mission Planner only shows battery 2 from the autopilot. Its sequence numbers interleave with the FC's, so Mission Planner's link quality may read low.
+
 ### Settings
 
 Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then add `Environment=...` lines under `[Service]`):
@@ -129,6 +138,9 @@ Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then ad
 |---|---|---|
 | `STATS_MAVLINK_PORT` | `14570` | UDP port on 127.0.0.1 for the FC battery |
 | `STATS_LIMA_PORT` | `14571` | UDP port on 127.0.0.1 for the Lima ON/OFF status |
+| `MAVLINK_BATT2` | `1` | Send the Pi battery to the GCS as battery 2. `0` turns it off |
+| `MAVLINK_BATT2_COMPID` | `1` | MAVLink component id used for that message. `191` (onboard computer) works for GCSs that show other components, not Mission Planner |
+| `MAVLINK_BATT2_TCP` | `127.0.0.1:5760` | mavlink-router TCP server (`host:port`) used to send it |
 | `INA226_BUS` | `1` | I2C bus (`/dev/i2c-N`) |
 | `INA226_ADDR` | `0x40` | I2C address |
 | `INA226_SHUNT_OHMS` | `0.1` | Shunt resistance. `0.01` for R010 |
