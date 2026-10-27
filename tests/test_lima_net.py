@@ -62,13 +62,15 @@ class NetTest(unittest.TestCase):
         self.serve = probe.getsockname()
         probe.close()
         self.gcs = self.sock()
+        self.status = self.sock()
         store = lima.AnchorStore(os.path.join(self.tmp.name, "anchor.json"))
         self.rewriter = lima.Rewriter(store, FAKE, 5000.0)
         self.stop = threading.Event()
         self.thread = threading.Thread(
             target=lima.run,
             args=(self.listen, self.serve, self.rewriter, self.stop),
-            kwargs={"allow": self.allow, "clock": lambda: self.now[0]})
+            kwargs={"allow": self.allow, "clock": lambda: self.now[0],
+                    "status": self.status.getsockname()})
         self.thread.start()
 
     def tearDown(self):
@@ -185,6 +187,40 @@ class NetTest(unittest.TestCase):
         self.gcs.settimeout(3)
         self.gcs.recvfrom(4096)
 
+    def wait_status(self, expected):
+        self.status.settimeout(3)
+        seen = []
+        while True:
+            try:
+                data, _ = self.status.recvfrom(64)
+            except socket.timeout:
+                self.fail(f"never saw {expected!r}, got {seen}")
+            if data == expected:
+                return
+            seen.append(data)
+
+    def test_status_follows_peer(self):
+        self.wait_status(b"LIMA 0")
+        self.connect(self.gcs)
+        self.wait_status(b"LIMA 1")
+        self.now[0] += 5.5
+        self.router_pump()
+        self.wait_status(b"LIMA 0")
+
+    def test_status_repeats_each_second(self):
+        self.wait_status(b"LIMA 0")
+        self.assert_silent(self.status)
+        self.now[0] += 1.1
+        self.wait_status(b"LIMA 0")
+
+    def test_status_unreachable_does_not_stop_proxy(self):
+        self.status.close()
+        self.connect(self.gcs)
+        self.now[0] += 2
+        self.router_pump()
+        self.gcs.settimeout(3)
+        self.gcs.recvfrom(4096)
+
     def test_peer_kept_alive_by_traffic(self):
         self.connect(self.gcs)
         for _ in range(3):
@@ -273,6 +309,7 @@ class MainTest(unittest.TestCase):
         serve, allow = run.call_args.args[1], run.call_args.kwargs["allow"]
         self.assertEqual(serve, ("0.0.0.0", 14551))
         self.assertIsNone(allow)
+        self.assertEqual(run.call_args.kwargs["status"], ("127.0.0.1", 14571))
 
     def test_main_reads_serve_and_allow(self):
         env = {"LIMA_SERVE": "10.0.0.1:15000", "LIMA_GCS_ALLOW": "10.46.93.5, 10.46.93.6"}
@@ -282,9 +319,15 @@ class MainTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[1], ("10.0.0.1", 15000))
         self.assertEqual(run.call_args.kwargs["allow"], {"10.46.93.5", "10.46.93.6"})
 
+    def test_main_reads_status(self):
+        with mock.patch.dict(os.environ, {"LIMA_STATUS": "127.0.0.1:15571"}, clear=True), \
+                mock.patch.object(lima, "run") as run:
+            lima.main()
+        self.assertEqual(run.call_args.kwargs["status"], ("127.0.0.1", 15571))
+
     def test_main_rejects_bad_settings(self):
         for key, val in (("LIMA_FAKE_ANCHOR", "x"), ("LIMA_LISTEN", "x"),
-                         ("LIMA_MAX_TARGET_KM", "x"), ("LIMA_SERVE", "nope"),
+                         ("LIMA_MAX_TARGET_KM", "x"), ("LIMA_SERVE", "nope"), ("LIMA_STATUS", "nope"),
                          ("LIMA_GCS_ALLOW", ""), ("LIMA_GCS_ALLOW", "1.2.3"),
                          ("LIMA_GCS_ALLOW", "1.2.3.4,x"), ("LIMA_GCS_ALLOW", "::1")):
             with mock.patch.dict(os.environ, {key: val}, clear=True), \

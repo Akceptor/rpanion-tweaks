@@ -397,15 +397,21 @@ def parse_ip_list(s):
     return {str(ipaddress.IPv4Address(part.strip())) for part in s.split(",")}
 
 
-def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic):
+STATUS_INTERVAL = 1.0
+
+
+def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic, status=None):
     from_router = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     from_gcs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    status_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         from_router.bind(listen)
         from_gcs.bind(serve)
         router_addr = None
         peer = None
         peer_seen = 0.0
+        status_sent = None
+        status_state = None
         anchored = rewriter.anchor is not None
         if anchored:
             log.info("Lima: anchor loaded")
@@ -443,9 +449,16 @@ def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic):
                             _send(from_router, pkt, router_addr)
                     for w in warnings:
                         _send(from_gcs, w, peer)
+            if status is not None:
+                state = peer is not None
+                now = clock()
+                if state != status_state or now - status_sent >= STATUS_INTERVAL:
+                    _send(status_sock, b"LIMA 1" if state else b"LIMA 0", status)
+                    status_state, status_sent = state, now
     finally:
         from_router.close()
         from_gcs.close()
+        status_sock.close()
 
 
 def _send(sock, data, dest):
@@ -479,13 +492,14 @@ def main():
     allow = _setting("LIMA_GCS_ALLOW", None, parse_ip_list) if "LIMA_GCS_ALLOW" in os.environ else None
     listen = _setting("LIMA_LISTEN", "127.0.0.1:14580", parse_hostport)
     fake_anchor = _setting("LIMA_FAKE_ANCHOR", "-12.0700,-77.0435", parse_latlon)
+    status = _setting("LIMA_STATUS", "127.0.0.1:14571", parse_hostport)
     max_km = _setting("LIMA_MAX_TARGET_KM", "5", _parse_km)
     store = AnchorStore(os.environ.get("LIMA_ANCHOR_FILE", "/run/lima/anchor.json"))
     rewriter = Rewriter(store, fake_anchor, max_km * 1000)
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    run(listen, serve, rewriter, stop, allow=allow)
+    run(listen, serve, rewriter, stop, allow=allow, status=status)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ PI 7.6V 1.2A 68%
 | `fps` | frames reaching the encoder | Per viewer |
 | `FC ...` (bottom left) | MAVLink `SYS_STATUS` / `BATTERY_STATUS` over UDP | Flight controller battery. Hidden if no data for 5 s. See [Battery overlay](#battery-overlay) |
 | `PI ...` (bottom left) | INA226 on I2C | Companion battery, measured before the BEC. Hidden if the sensor is absent. See [Battery overlay](#battery-overlay) |
+| `Lima: ON/OFF` (bottom centre) | Lima status UDP `127.0.0.1:14571` | ON while a GCS is connected to Lima, OFF otherwise (including Lima not installed or stopped). See [Lima](#lima-fake-position-on-the-gcs-map) |
 
 Fields that aren't available on your hardware are hidden. Slow commands (`vcgencmd`, `mmcli`) run every 5 s in a background thread so they never stall the video.
 
@@ -114,6 +115,7 @@ Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then ad
 | Variable | Default | Meaning |
 |---|---|---|
 | `STATS_MAVLINK_PORT` | `14570` | UDP port on 127.0.0.1 for the FC battery |
+| `STATS_LIMA_PORT` | `14571` | UDP port on 127.0.0.1 for the Lima ON/OFF status |
 | `INA226_BUS` | `1` | I2C bus (`/dev/i2c-N`) |
 | `INA226_ADDR` | `0x40` | I2C address |
 | `INA226_SHUNT_OHMS` | `0.1` | Shunt resistance. `0.01` for R010 |
@@ -149,6 +151,8 @@ FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (re
 The anchor lives in `/run/lima/` (tmpfs), so it is cleared when the Pi reboots and a new one is taken at the next first fix. A mission saved in the GCS and loaded after a Pi reboot lands shifted by the distance between the two start points. Only the `LIMA_MAX_TARGET_KM` guard catches it, and only for big shifts. Missions stored on the FC are fine (converted fresh on each download).
 
 If Lima alone restarts, it reuses the anchor and the icon doesn't jump.
+
+The video HUD shows `Lima: ON` while a GCS is connected to Lima and `Lima: OFF` otherwise (also if Lima stops).
 
 ### What's dropped
 
@@ -221,6 +225,7 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 |---|---|---|
 | `LIMA_SERVE` | `0.0.0.0:14551` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
 | `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
+| `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second ON/OFF status for the video HUD (`STATS_LIMA_PORT`) |
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
 | `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
 | `LIMA_MAX_TARGET_KM` | `5` | Uplink guard: drop GCS targets farther than this from the rover |
