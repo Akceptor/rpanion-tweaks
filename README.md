@@ -142,7 +142,7 @@ FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (re
 - Logs (Rpanion DataFlash logger, FC SD card), NTRIP, cloud upload, the Rpanion web UI: all stay real.
 - The camera image.
 - **The GCS's own location.** Turn off Windows location services and any USB GPS in QGC/Mission Planner before streaming, or the PC's real position shows on the map.
-- Any GCS connection that bypasses Lima (Rpanion UDP server `14550`, TCP server `5760`, direct GCS UDP output). Those stay enabled in the setup below as the real stream, so Lima hides nothing if the GCS is on them. See the warning under setup.
+- Any GCS connection that bypasses Lima (Rpanion UDP server `14550`, TCP server `5760`, direct GCS UDP output). These stay enabled and carry the real position.
 
 ### Saved missions shift
 
