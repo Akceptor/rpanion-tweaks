@@ -233,7 +233,7 @@ Changing `LIMA_FAKE_ANCHOR` takes effect on the next Lima restart. The real-side
 sudo systemctl disable --now lima
 ```
 
-In the Rpanion web UI, remove `127.0.0.1:14580` and add the direct GCS UDP output back.
+In the Rpanion web UI, remove `127.0.0.1:14580`. Connect the GCS to `:14550` as usual.
 
 ## Install
 
