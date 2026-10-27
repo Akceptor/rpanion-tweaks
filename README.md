@@ -182,7 +182,7 @@ sudo chown root:root /usr/local/lib/lima/lima.py
 sudo chmod 644 /usr/local/lib/lima/lima.py
 sudo systemctl daemon-reload
 
-# optional: only accept GCS packets from the PC's ZeroTier IP
+# optional: restrict which GCS IPs Lima accepts (see LIMA_GCS_ALLOW below)
 # sudo systemctl edit lima
 # [Service]
 # Environment=LIMA_GCS_ALLOW=<pc-zerotier-ip>
@@ -192,26 +192,14 @@ sudo systemctl enable --now lima
 
 Lima is a UDP server on port 14551, next to Rpanion's own UDP Server on 14550. The Pi never sends to a GCS first: nothing goes out until a GCS sends Lima a packet, and the GCS must connect to the Pi (see below). Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
 
-Then in Rpanion's web UI, **Flight Controller** page (stop telemetry first):
+One-time Rpanion setup, **Flight Controller** page: stop telemetry, add **Telemetry Destinations** → **UDP Client** `127.0.0.1:14580` (keep `14540` and `14570`), start telemetry. Rpanion's UDP/TCP servers can stay as they are.
 
-1. Remove any direct GCS UDP output.
-2. **Telemetry Destinations** → **UDP Client** → add `127.0.0.1:14580`.
-3. Keep `127.0.0.1:14570` (the HUD) and `127.0.0.1:14540`.
-4. Start telemetry.
+Then connect the GCS to the Pi (e.g. `10.46.93.18`):
 
-Rpanion's **UDP Server** (14550) and **TCP Server** (5760) can stay enabled. They give the real, unshifted stream, so you choose per session by port.
+- `:14551` for the masked position (Mission Planner UDPCl, or a QGC Comm Links UDP server).
+- `:14550` as usual for the real position.
 
-On the GCS (the PC connects to the Pi):
-
-| Want | Port on `<Pi IP>` (e.g. `10.46.93.18`) |
-|---|---|
-| Lima (fake position) | `14551` |
-| Real position | `14550` |
-
-- Mission Planner: connection type UDPCl, host the Pi IP, port 14551 (Lima) or 14550 (real).
-- QGroundControl: Application Settings → Comm Links → Add → Type UDP, add Server `<Pi IP>:14551`, Connect.
-
-> **Warning: Lima hides nothing if the GCS is also connected to 14550 or 5760, or connected there instead.** Connect to only one. Before sharing video or screen, confirm the map shows Lima. A GCS that auto-connects (QGC AutoConnect UDP on 14550, saved links) can pull the real stream, so check Comm Links and remove or disable those.
+Note: connect to one port at a time.
 
 Since the Pi never sends first, no inbound firewall rule is needed on the PC. If the GCS goes quiet for 5 s, Lima forgets it and stops sending until the next packet arrives.
 
