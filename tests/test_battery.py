@@ -223,5 +223,23 @@ class PiLineTest(unittest.TestCase):
         self.assertEqual(vs.format_pi_line(None, None, False, None), "")
 
 
+class LimaLineTest(unittest.TestCase):
+    def test_off_before_first_datagram(self):
+        self.assertEqual(vs.lima_line({}, 100.0), "Lima: OFF")
+
+    def test_on_off_and_stale(self):
+        state = {}
+        vs.apply_lima(state, b"LIMA 1", 100.0)
+        self.assertEqual(vs.lima_line(state, 102.9), "Lima: ON")
+        self.assertEqual(vs.lima_line(state, 103.1), "Lima: OFF")
+        vs.apply_lima(state, b"LIMA 0", 104.0)
+        self.assertEqual(vs.lima_line(state, 104.5), "Lima: OFF")
+
+    def test_garbage_ignored(self):
+        state = {}
+        vs.apply_lima(state, b"hello", 100.0)
+        self.assertEqual(vs.lima_line(state, 100.0), "Lima: OFF")
+
+
 if __name__ == "__main__":
     unittest.main()

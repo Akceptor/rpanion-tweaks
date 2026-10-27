@@ -25,6 +25,7 @@ PI 7.6V 1.2A 68%
 | `fps` | frames reaching the encoder | Per viewer |
 | `FC ...` (bottom left) | MAVLink `SYS_STATUS` / `BATTERY_STATUS` over UDP | Flight controller battery. Hidden if no data for 5 s. See [Battery overlay](#battery-overlay) |
 | `PI ...` (bottom left) | INA226 on I2C | Companion battery, measured before the BEC. Hidden if the sensor is absent. See [Battery overlay](#battery-overlay) |
+| `Lima: ON/OFF` (bottom centre) | Lima status UDP `127.0.0.1:14571` | ON while a GCS is connected to Lima, OFF otherwise (including Lima not installed or stopped). See [Lima](#lima-fake-position-on-the-gcs-map) |
 
 Fields that aren't available on your hardware are hidden. Slow commands (`vcgencmd`, `mmcli`) run every 5 s in a background thread so they never stall the video.
 
@@ -127,12 +128,130 @@ Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then ad
 | Variable | Default | Meaning |
 |---|---|---|
 | `STATS_MAVLINK_PORT` | `14570` | UDP port on 127.0.0.1 for the FC battery |
+| `STATS_LIMA_PORT` | `14571` | UDP port on 127.0.0.1 for the Lima ON/OFF status |
 | `INA226_BUS` | `1` | I2C bus (`/dev/i2c-N`) |
 | `INA226_ADDR` | `0x40` | I2C address |
 | `INA226_SHUNT_OHMS` | `0.1` | Shunt resistance. `0.01` for R010 |
 | `PI_BATT_CELLS` | `2` | Cells in the Pi battery, for the %. `0` hides the % |
 
 The Pi battery % is a voltage estimate. It sags under load, so expect it to read low while the modem is busy. The table is for LiPo; Li-ion packs will read low.
+
+## Lima (fake position on the GCS map)
+
+`python/lima.py` is a MAVLink proxy that sits on the GCS link only. The ground station (QGC, Mission Planner) shows the rover in Lima, Peru, moving exactly as it really moves. Commands from the GCS (missions, "drive here", set home, fences) are shifted back, so the rover drives where you meant.
+
+```
+FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (real)
+                      └─ 127.0.0.1:14580 ─ Lima ─ UDP ─ GCS PC       (fake)
+```
+
+- The rover's first good GPS fix (3D or better) after Lima starts maps to the Lima point. No reference point to set.
+- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one.
+- The shift is in metres, so distances and headings on the map match reality. Altitude is unchanged.
+- Fails closed: a crash, a missing setting, or a message with a position Lima can't convert means the GCS gets nothing, never the real value.
+- After converting a GCS target back, anything more than `LIMA_MAX_TARGET_KM` from the rover is dropped and the GCS gets a `STATUSTEXT` warning.
+- MAVLink2 signing must be off (the ArduPilot default), because rewriting breaks signatures.
+
+### What it doesn't hide
+
+- Logs (Rpanion DataFlash logger, FC SD card), NTRIP, cloud upload, the Rpanion web UI: all stay real.
+- The camera image.
+- **The GCS's own location.** Turn off Windows location services and any USB GPS in QGC/Mission Planner before streaming, or the PC's real position shows on the map.
+- Any GCS connection that bypasses Lima (Rpanion UDP server `14550`, TCP server `5760`, direct GCS UDP output). These stay enabled and carry the real position.
+
+### Saved missions shift
+
+The anchor lives in `/run/lima/` (tmpfs), so it is cleared when the Pi reboots and a new one is taken at the next first fix. A mission saved in the GCS and loaded after a Pi reboot lands shifted by the distance between the two start points. Only the `LIMA_MAX_TARGET_KM` guard catches it, and only for big shifts. Missions stored on the FC are fine (converted fresh on each download).
+
+If Lima alone restarts, it reuses the anchor and the icon doesn't jump.
+
+The video HUD shows `Lima: ON` while a GCS is connected to Lima and `Lima: OFF` otherwise (also if Lima stops).
+
+### What's dropped
+
+These carry data Lima can't safely convert, so they don't pass:
+
+| Feature | Effect |
+|---|---|
+| MAVFTP (`FILE_TRANSFER_PROTOCOL`) | GCS falls back to the normal parameter/mission protocols. QGC parameter load is slower; Lua script upload through the GCS doesn't work |
+| Log download (`LOG_ENTRY`, `LOG_DATA`, requests) | Use the Rpanion web UI logs instead |
+| MAVLink console (`SERIAL_CONTROL`) | Not available through Lima |
+| Follow-me (`FOLLOW_TARGET`) | Not available |
+| ADS-B traffic (`ADSB_VEHICLE`) | No nearby traffic shown on the map (its position and callsign would give away the area) |
+
+RTK corrections from the GCS (`GPS_RTCM_DATA`) still reach the FC.
+
+### Install Lima
+
+`pymavlink` comes with the Rpanion `.deb` for user `rpanion`. Check:
+
+```bash
+sudo -u rpanion python3 -c "from pymavlink.dialects.v20 import ardupilotmega as m; m.enums['MAV_CMD'][16].has_location"
+```
+
+On the Pi:
+
+```bash
+sudo mkdir -p /usr/local/lib/lima
+sudo wget -O /usr/local/lib/lima/lima.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/lima.py
+sudo wget -O /etc/systemd/system/lima.service https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/systemd/lima.service
+sudo chown root:root /usr/local/lib/lima/lima.py
+sudo chmod 644 /usr/local/lib/lima/lima.py
+sudo systemctl daemon-reload
+
+# optional: restrict which GCS IPs Lima accepts (see LIMA_GCS_ALLOW below)
+# sudo systemctl edit lima
+# [Service]
+# Environment=LIMA_GCS_ALLOW=<pc-zerotier-ip>
+
+sudo systemctl enable --now lima
+```
+
+Lima is a UDP server on port 14551, next to Rpanion's own UDP Server on 14550. The Pi never sends to a GCS first: nothing goes out until a GCS sends Lima a packet, and the GCS must connect to the Pi (see below). Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
+
+One-time Rpanion setup, **Flight Controller** page: stop telemetry, add **Telemetry Destinations** → **UDP Client** `127.0.0.1:14580` (keep `14540` and `14570`), start telemetry. Rpanion's UDP/TCP servers can stay as they are.
+
+Then connect the GCS to the Pi (e.g. `10.46.93.18`):
+
+- `:14551` for the masked position (Mission Planner UDPCl, or a QGC Comm Links UDP server).
+- `:14550` as usual for the real position.
+
+Note: connect to one port at a time.
+
+Since the Pi never sends first, no inbound firewall rule is needed on the PC. If the GCS goes quiet for 5 s, Lima forgets it and stops sending until the next packet arrives.
+
+### Check
+
+```bash
+systemctl status lima
+journalctl -u lima -f
+```
+
+- With the rover having a GPS fix, the journal shows `Lima: anchor set` (or `Lima: anchor loaded` after a Lima restart), and QGC shows the rover in Lima.
+- `systemctl status lima` showing exit code 2 means a setting is invalid (see `journalctl -u lima`). The service doesn't restart-loop in that case.
+
+### Settings
+
+Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines under `[Service]`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LIMA_SERVE` | `0.0.0.0:14551` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
+| `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
+| `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second ON/OFF status for the video HUD (`STATS_LIMA_PORT`) |
+| `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
+| `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
+| `LIMA_MAX_TARGET_KM` | `5` | Uplink guard: drop GCS targets farther than this from the rover |
+
+Changing `LIMA_FAKE_ANCHOR` takes effect on the next Lima restart. The real-side anchor only resets on a Pi reboot, so reboot the Pi when moving to a new site.
+
+### Revert
+
+```bash
+sudo systemctl disable --now lima
+```
+
+In the Rpanion web UI, remove `127.0.0.1:14580`. Connect the GCS to `:14550` as usual.
 
 ## Install
 

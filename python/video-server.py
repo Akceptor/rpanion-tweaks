@@ -270,6 +270,35 @@ class MavlinkBattery(threading.Thread):
                 apply_mavlink(self.state, msgid, compid, payload, now)
 
 
+def apply_lima(state: dict, data: bytes, now: float):
+    if data in (b"LIMA 0", b"LIMA 1"):
+        state["on"] = data == b"LIMA 1"
+        state["ts"] = now
+
+
+def lima_line(state: dict, now: float) -> str:
+    on = state.get("on") and now - state["ts"] <= 3
+    return "Lima: ON" if on else "Lima: OFF"
+
+
+# Listens for the status datagrams that lima.py sends once per second
+class LimaStatus(threading.Thread):
+    def __init__(self, port: int):
+        super().__init__(daemon=True)
+        self.port = port
+        self.state = {}
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("127.0.0.1", self.port))
+        except OSError as e:
+            print("Lima overlay: cannot bind UDP 127.0.0.1:{0} ({1}), Lima status disabled".format(self.port, e))
+            return
+        while True:
+            apply_lima(self.state, sock.recv(64), time.monotonic())
+
+
 # Returns (bus volts, amps, shunt saturated). Raw shunt is signed, 2.5 uV/LSB;
 # bus is unsigned, 1.25 mV/LSB. Full scale is 81.92 mV, so a clipped reading is flagged.
 def ina226_convert(bus_raw: int, shunt_raw: int, shunt_ohms: float):
@@ -378,6 +407,7 @@ class SystemStats(threading.Thread):
             cls._instance = SystemStats()
             cls._instance.start()
             cls._instance.mavlink.start()
+            cls._instance.lima.start()
         return cls._instance
 
     def __init__(self):
@@ -385,6 +415,7 @@ class SystemStats(threading.Thread):
         self.lines = ["", ""]
         self.batt_lines = ["", ""]
         self.mavlink = MavlinkBattery(env_number("STATS_MAVLINK_PORT", 14570))
+        self.lima = LimaStatus(env_number("STATS_LIMA_PORT", 14571))
         self.ina = Ina226()
 
     def run(self):
@@ -443,6 +474,7 @@ def attach_stats(pipeline):
     if overlay is None:
         return None
     battoverlay = pipeline.get_by_name("battoverlay")
+    limaoverlay = pipeline.get_by_name("limaoverlay")
 
     stats = SystemStats.get()
     frames = [0]
@@ -467,6 +499,8 @@ def attach_stats(pipeline):
         overlay.set_property("text", net + "\n" + system)
         if battoverlay is not None:
             battoverlay.set_property("text", "\n".join(l for l in stats.batt_lines if l))
+        if limaoverlay is not None:
+            limaoverlay.set_property("text", lima_line(stats.lima.state, now))
         return True
 
     return GLib.timeout_add(1000, tick)
@@ -571,6 +605,8 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
             pipeline.append("textoverlay name=statsoverlay text=\"\" valignment=top halignment=right line-alignment=right "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
             pipeline.append("textoverlay name=battoverlay text=\"\" valignment=bottom halignment=left line-alignment=left "
+                            "font-desc=\"Sans 10\" shaded-background=true ypad=10")
+            pipeline.append("textoverlay name=limaoverlay text=\"\" valignment=bottom halignment=center "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
 
         # 3 options for H264: Rpi hardware compression (v4l2h264enc), Jetson hardware compression (nvv4l2h264enc)
