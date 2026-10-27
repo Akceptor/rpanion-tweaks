@@ -174,7 +174,7 @@ def crc_x25(data: bytes, crc: int = 0xFFFF) -> int:
 MAVLINK_MSGS = {1: (124, 31), 147: (154, 36)}
 
 
-# Returns (msgid, compid, payload) for each valid SYS_STATUS / BATTERY_STATUS frame in buf,
+# Returns (msgid, compid, payload, sysid) for each valid SYS_STATUS / BATTERY_STATUS frame in buf,
 # ignoring garbage and everything else
 def parse_mavlink_frames(buf: bytes):
     frames = []
@@ -184,12 +184,12 @@ def parse_mavlink_frames(buf: bytes):
         if stx == 0xFE and i + 6 <= len(buf):
             length = buf[i + 1]
             hdr_len, signature = 5, 0
-            compid, msgid = buf[i + 4], buf[i + 5]
+            sysid, compid, msgid = buf[i + 3], buf[i + 4], buf[i + 5]
         elif stx == 0xFD and i + 10 <= len(buf):
             length = buf[i + 1]
             hdr_len = 9
             signature = 13 if buf[i + 2] & 0x01 else 0
-            compid = buf[i + 6]
+            sysid, compid = buf[i + 5], buf[i + 6]
             msgid = int.from_bytes(buf[i + 7:i + 10], "little")
         else:
             i += 1
@@ -202,7 +202,7 @@ def parse_mavlink_frames(buf: bytes):
             if crc == int.from_bytes(buf[end:end + 2], "little"):
                 # v2 drops trailing zero bytes of the payload
                 payload = buf[i + 1 + hdr_len:end].ljust(base_len, b"\0")
-                frames.append((msgid, compid, payload))
+                frames.append((msgid, compid, payload, sysid))
                 i = end + 2 + signature
                 continue
         i += 1
@@ -222,9 +222,11 @@ def decode_battery_status(payload: bytes):
 
 
 # Updates state in place from one parsed frame. Only the autopilot (compid 1) is trusted.
-def apply_mavlink(state: dict, msgid: int, compid: int, payload: bytes, now: float):
+def apply_mavlink(state: dict, msgid: int, compid: int, payload: bytes, now: float, sysid=None):
     if compid != 1:
         return
+    if sysid is not None:
+        state["sysid"] = sysid
     if msgid == 1:
         state["volts"], state["amps"], state["pct"] = decode_sys_status(payload)
         state["ts"] = now
@@ -234,8 +236,28 @@ def apply_mavlink(state: dict, msgid: int, compid: int, payload: bytes, now: flo
             state["mah"] = mah
 
 
+def fc_fresh(state: dict, now: float) -> bool:
+    return now - state.get("ts", -1e9) <= 5
+
+
+def clamp(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, value))
+
+
+# BATTERY_STATUS (147) as a MAVLink v2 frame, battery id 1 (a second battery next to the FC's id 0)
+def encode_battery_status(sysid: int, compid: int, seq: int, volts, amps, pct) -> bytes:
+    mv = 65535 if volts is None else clamp(round(volts * 1000), 0, 65534)
+    ca = -1 if amps is None else clamp(round(amps * 100), -32768, 32767)
+    rem = -1 if pct is None else clamp(round(pct), 0, 100)
+    # ArduPilot puts the whole pack voltage in cell 0 when cells are unknown
+    payload = struct.pack("<iihH9HhBBBb", -1, -1, 32767, mv, *([65535] * 9), ca, 1, 0, 0, rem)
+    hdr = bytes([len(payload), 0, 0, seq & 0xFF, sysid & 0xFF, compid & 0xFF]) + (147).to_bytes(3, "little")
+    crc = crc_x25(hdr + payload + bytes([MAVLINK_MSGS[147][0]]))
+    return b"\xFD" + hdr + payload + struct.pack("<H", crc)
+
+
 def fc_line(state: dict, now: float) -> str:
-    if now - state.get("ts", -1e9) > 5:
+    if not fc_fresh(state, now):
         return ""
     parts = []
     if state.get("volts") is not None:
@@ -249,12 +271,97 @@ def fc_line(state: dict, now: float) -> str:
     return " ".join(["FC"] + parts) if parts else ""
 
 
-# Listens on a UDP port that the user adds as a mavlink-router destination in Rpanion
+def parse_host_port(value, default):
+    try:
+        host, port = value.rsplit(":", 1)
+        port = int(port)
+        if host and 0 < port < 65536:
+            return host, port
+    except (AttributeError, ValueError):
+        pass
+    return default
+
+
+# Sends frames over a TCP client connection to mavlink-router's TCP server. Whatever the router
+# forwards to this connection is read and discarded so its send buffer never fills up.
+# Reconnects at most every 10 s.
+class Batt2Sender(threading.Thread):
+    def __init__(self, target=None):
+        super().__init__(daemon=True)
+        default = ("127.0.0.1", 5760)
+        if target is None:
+            target = parse_host_port(os.environ.get("MAVLINK_BATT2_TCP"), default)
+        self.host, self.port = target
+        self.sock = None
+        self.lock = threading.Lock()
+
+    @property
+    def connected(self) -> bool:
+        return self.sock is not None
+
+    def run(self):
+        while True:
+            sock = None
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=3)
+                sock.settimeout(2)
+                with self.lock:
+                    self.sock = sock
+                while self.drain(sock):
+                    pass
+            except OSError:
+                pass
+            self.drop(sock)
+            time.sleep(10)
+
+    @staticmethod
+    def drain(sock) -> bool:
+        try:
+            return bool(sock.recv(4096))
+        except socket.timeout:
+            return True
+
+    def drop(self, sock):
+        if sock is None:
+            return
+        with self.lock:
+            if self.sock is sock:
+                self.sock = None
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+    def send(self, frame: bytes):
+        with self.lock:
+            sock = self.sock
+            if sock is None:
+                return
+            try:
+                sock.sendall(frame)
+                return
+            except OSError:
+                pass
+        self.drop(sock)
+
+
+# Reads the FC's telemetry from a UDP port that the user adds as a mavlink-router destination in
+# Rpanion, and injects the Pi battery as battery 2 through a separate router endpoint (Batt2Sender)
 class MavlinkBattery(threading.Thread):
-    def __init__(self, port: int):
+    def __init__(self, port: int, enabled=None, compid=None):
         super().__init__(daemon=True)
         self.port = port
         self.state = {}
+        self.enabled = env_number("MAVLINK_BATT2", 1) != 0 if enabled is None else enabled
+        # Mission Planner only shows battery 2 from the autopilot (1/1), so we spoof it. mavlink-router
+        # never forwards a message to an endpoint that has sent the same sysid/compid, so sending
+        # this from the 14570 socket would cut it off from the FC's telemetry. A TCP connection is
+        # its own endpoint, so only that one is affected. Side effect: our seq interleaves with the
+        # FC's for 1/1, so Mission Planner's link quality / packet loss reads worse than reality.
+        self.compid = env_number("MAVLINK_BATT2_COMPID", 1) if compid is None else compid
+        self.sender = Batt2Sender()
+        self.seq = 0
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -266,8 +373,17 @@ class MavlinkBattery(threading.Thread):
         while True:
             data = sock.recv(2048)
             now = time.monotonic()
-            for msgid, compid, payload in parse_mavlink_frames(data):
-                apply_mavlink(self.state, msgid, compid, payload, now)
+            for msgid, compid, payload, sysid in parse_mavlink_frames(data):
+                apply_mavlink(self.state, msgid, compid, payload, now, sysid)
+
+    def send_batt2(self, reading, now: float):
+        sysid = self.state.get("sysid")
+        if (not self.enabled or reading is None or sysid is None or self.sender is None
+                or not self.sender.connected or not fc_fresh(self.state, now)):
+            return
+        frame = encode_battery_status(sysid, self.compid, self.seq, *reading)
+        self.seq = (self.seq + 1) & 0xFF
+        self.sender.send(frame)
 
 
 def apply_lima(state: dict, data: bytes, now: float):
@@ -357,6 +473,7 @@ class Ina226:
         if self.shunt_ohms <= 0:
             self.shunt_ohms = 0.1
         self.cells = env_number("PI_BATT_CELLS", 2)
+        self.last = None  # (volts, amps, pct) from the latest line() call, None if unreadable
         self.fd = None
         self.next_try = 0.0
 
@@ -365,6 +482,7 @@ class Ina226:
         return int.from_bytes(os.read(self.fd, 2), "big")
 
     def line(self, now: float) -> str:
+        self.last = None
         if self.fd is None:
             if now < self.next_try:
                 return ""
@@ -385,7 +503,9 @@ class Ina226:
         if shunt >= 0x8000:
             shunt -= 0x10000
         volts, amps, saturated = ina226_convert(bus, shunt, self.shunt_ohms)
-        return format_pi_line(volts, amps, saturated, pack_percent(volts, self.cells))
+        pct = pack_percent(volts, self.cells)
+        self.last = (volts, amps, pct)
+        return format_pi_line(volts, amps, saturated, pct)
 
     def close(self):
         if self.fd is not None:
@@ -407,6 +527,8 @@ class SystemStats(threading.Thread):
             cls._instance = SystemStats()
             cls._instance.start()
             cls._instance.mavlink.start()
+            if cls._instance.mavlink.enabled:
+                cls._instance.mavlink.sender.start()
             cls._instance.lima.start()
         return cls._instance
 
@@ -465,6 +587,7 @@ class SystemStats(threading.Thread):
                 net += " | " + slow["signal"]
             self.lines = [net, " | ".join(sys_parts)]
             self.batt_lines = [fc_line(self.mavlink.state, now), self.ina.line(now)]
+            self.mavlink.send_batt2(self.ina.last, now)
 
 
 # Updates the "statsoverlay" textoverlay (if present) once per second with
@@ -784,6 +907,9 @@ if __name__ == '__main__':
 
     Gst.debug_set_active(True)
     Gst.debug_set_default_threshold(3)
+
+    # Started here, not on the first RTSP viewer, so battery 2 reaches the GCS even when no one watches the video
+    SystemStats.get()
 
     if args.multirtsp != "":
         # Multi-camera streaming, delimited via ';'
