@@ -267,6 +267,93 @@ sudo systemctl disable --now lima
 
 In the Rpanion web UI, remove `127.0.0.1:14580`. Connect the GCS to `:14550` as usual.
 
+## AGPS (faster first GPS fix)
+
+`python/agps.py` runs on the Pi and, at every FC/GPS boot, tells the u-blox M10 through ArduPilot (`GPS_INJECT_DATA`, targeted at the FC only) to turn on AssistNow Autonomous, then sends it the current UTC time (only if the Pi's clock is NTP-synced) and an approximate position (if it has one). Nothing needs an account or a token, and nothing about the position leaves the vehicle (Pi + FC).
+
+Position source, first that applies: the last good fix the service cached on the Pi (younger than `AGPS_CACHE_MAX_DAYS`), then `AGPS_APPROX_LAT`/`AGPS_APPROX_LON` from `/etc/agps.env`, otherwise time only. The journal logs the time from "GPS detected" to first 3D fix on every boot, so you can compare with the service off.
+
+### What it doesn't do
+
+- First fix ever. AssistNow Autonomous builds its predictions from ephemerides the receiver has already downloaded. A receiver that never had a fix, or whose backup supercap has run flat, only gets time and position: a warm start, not a hot one. Once, power the rover outdoors with open sky and leave it running at least 15 min after the first fix.
+- Short power-offs (under about 4 h). The receiver already has everything. It matters after longer power-offs and after the supercap has drained.
+- Proof of acceptance. The receiver's replies never reach the Pi, so the effect is measured (time to first fix), not confirmed.
+
+### Privacy
+
+The cache stores your area (rounded to ~1 km) in `/var/lib/agps/last_fix.json` on the SD card, mode 0600. `AGPS_CACHE=0` turns it off and deletes the file. Injected data goes only to the FC. Logs never contain coordinates.
+
+### Install (on the Pi)
+
+`/etc/agps.env` may already exist (with tokens used by other things): edit it, don't overwrite it. The service ignores variables it doesn't know. The script needs `pymavlink` for the system `python3`.
+
+```bash
+sudo mkdir -p /usr/local/lib/agps
+sudo wget -O /usr/local/lib/agps/agps.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/agps.py
+sudo wget -O /etc/systemd/system/agps.service https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/systemd/agps.service
+sudo chmod 644 /usr/local/lib/agps/agps.py
+sudo touch /etc/agps.env && sudo chmod 600 /etc/agps.env
+sudoedit /etc/agps.env      # optional, see the settings below
+sudo systemctl daemon-reload && sudo systemctl enable --now agps
+```
+
+Example `/etc/agps.env` (placeholders):
+
+```
+AGPS_APPROX_LAT=<lat, rounded to 0.1 degree>
+AGPS_APPROX_LON=<lon, rounded to 0.1 degree>
+AGPS_APPROX_ACC_KM=<radius of the area in km, 1..500>
+```
+
+Check:
+
+```bash
+sudo -u rpanion python3 /usr/local/lib/agps/agps.py probe   # prints u-blox ... HW: 000A0000 ...
+journalctl -u agps -b                                       # "sent valset,time,pos=..." and "first 3D fix ...s"
+```
+
+Don't set `GPS_AUTO_CONFIG=3` on the FC (newer ArduPilot builds then reset the receiver config at boot).
+
+### Settings
+
+Set in `/etc/agps.env` (no spaces around `=`). An invalid number makes the service exit with status 2, except `AGPS_APPROX_ACC_KM`, which falls back to its default with a log line.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGPS_ENABLE` | `1` | `0` exits at once |
+| `AGPS_MAVLINK` | `tcp:127.0.0.1:5760` | pymavlink connection string |
+| `AGPS_SETTLE_S` | `15` | wait after the GPS is detected |
+| `AGPS_APPROX_LAT`, `AGPS_APPROX_LON` | unset | manual coarse position |
+| `AGPS_APPROX_ALT_M` | `0` | ellipsoid altitude for the manual position |
+| `AGPS_APPROX_ACC_KM` | `50` | accuracy radius of the manual position, 1..500. Use the radius that covers every place the rover may start from, measured from the point you typed |
+| `AGPS_STATUS` | `127.0.0.1:14572` | `host:port` that gets a 1 Hz UDP line `AGPS <cache\|manual> <acc_m> <lat> <lon>` while waiting for the first 3D fix, so the video HUD can show the approximate position used. Empty disables. Invalid exits with status 2. Never logged |
+| `AGPS_CACHE` | `1` | `0` disables the cache and deletes the file |
+| `AGPS_CACHE_FILE` | `/var/lib/agps/last_fix.json` | |
+| `AGPS_CACHE_MAX_DAYS` | `14` | older cache entries are ignored |
+| `AGPS_CACHE_ACC_KM` | `25` | accuracy of a cached position |
+
+### Test tools
+
+```bash
+sudo systemctl stop agps
+sudo -u rpanion python3 /usr/local/lib/agps/agps.py inject            # send the bundle once now
+sudo -u rpanion python3 /usr/local/lib/agps/agps.py reset warm-noana  # hot | warm | warm-noana | cold
+```
+
+`reset` sends a GPS reset (ArduPilot loses GPS until the fix is back), so use it on the bench only. It refuses when the vehicle is armed. `cold` also wipes the AssistNow Autonomous data.
+
+### Measuring
+
+Outdoors, disarmed, open sky, 5 runs each: baseline (`reset warm-noana`, agps stopped), cold without assist (`reset cold`, agps stopped), cold with assist (`reset cold`, then `inject` at once), and real life (overnight power-off, agps on and off on alternate days). Time to first fix comes from `journalctl -u agps` or a stopwatch to GPS fix 3 in the GCS.
+
+### Remove
+
+```bash
+sudo systemctl disable --now agps
+```
+
+The receiver keeps `CFG-ANA-USE_ANA=1`, which is harmless.
+
 ## Install
 
 Rpanion 0.12 from the `.deb` lives in `/usr/share/rpanion-server/app` and runs as the `rpanion-server` service.
