@@ -188,13 +188,13 @@ def _approx_acc_m(env):
     return km * 1000
 
 
-def _status_addr(env):
-    raw = env.get("AGPS_STATUS", "127.0.0.1:14572")
+def _host_port(env, name, default):
+    raw = env.get(name, default)
     if raw == "":
         return None
     host, sep, port = raw.rpartition(":")
     if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
-        raise ValueError("invalid AGPS_STATUS: expected host:port")
+        raise ValueError(f"invalid {name}: expected host:port")
     return host, int(port)
 
 
@@ -209,6 +209,8 @@ class Settings(NamedTuple):
     manual: object
     manual_acc_m: float
     status: object
+    map_icon: bool
+    map_tcp: tuple
 
     @classmethod
     def from_env(cls, env):
@@ -222,7 +224,9 @@ class Settings(NamedTuple):
             cache_acc_m=_number(env, "AGPS_CACHE_ACC_KM", "25", 1000),
             manual=parse_manual(env),
             manual_acc_m=_approx_acc_m(env),
-            status=_status_addr(env),
+            status=_host_port(env, "AGPS_STATUS", "127.0.0.1:14572"),
+            map_icon=env.get("AGPS_MAP_ICON", "1") != "0",
+            map_tcp=_host_port(env, "AGPS_MAP_TCP", "127.0.0.1:5760") or ("127.0.0.1", 5760),
         )
 
 
@@ -249,6 +253,66 @@ def udp_status_sender(dest):
             pass
 
     return send
+
+
+# The router stops forwarding 1/1 to a connection that has sent 1/1, so the spoof must never
+# share the 1/193 telemetry connection. Whatever the router sends here is read and discarded.
+class TcpFrameSender(threading.Thread):
+    def __init__(self, host, port, retry_s=10):
+        super().__init__(daemon=True)
+        self.host, self.port, self.retry_s = host, port, retry_s
+        self.sock = None
+        self.lock = threading.Lock()
+
+    @property
+    def connected(self):
+        return self.sock is not None
+
+    def run(self):
+        while True:
+            sock = None
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=3)
+                sock.settimeout(2)
+                with self.lock:
+                    self.sock = sock
+                while self._drain(sock):
+                    pass
+            except OSError:
+                pass
+            self._drop(sock)
+            time.sleep(self.retry_s)
+
+    @staticmethod
+    def _drain(sock):
+        try:
+            return bool(sock.recv(4096))
+        except socket.timeout:
+            return True
+
+    def _drop(self, sock):
+        if sock is None:
+            return
+        with self.lock:
+            if self.sock is sock:
+                self.sock = None
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+    def send(self, frame):
+        with self.lock:
+            sock = self.sock
+            if sock is None:
+                return
+            try:
+                sock.sendall(frame)
+                return
+            except OSError:
+                pass
+        self._drop(sock)
 
 
 STATUSTEXT_ICON = b"AGPS: map icon approximate until GPS fix"
@@ -502,7 +566,12 @@ def main(argv=None, env=os.environ, connect=None):
 
     if cmd == "run":
         send = udp_status_sender(settings.status) if settings.status else None
-        runner = Runner(conn, settings, cache, status_send=send)
+        icon = None
+        if settings.map_icon:
+            sender = TcpFrameSender(*settings.map_tcp)
+            sender.start()
+            icon = ApproxIcon(sender.send)
+        runner = Runner(conn, settings, cache, status_send=send, icon=icon)
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())

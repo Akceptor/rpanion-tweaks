@@ -64,6 +64,23 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(s.manual, (47.0, 8.0, 0.0))
         self.assertEqual(s.manual_acc_m, 10000)
 
+    def test_map_icon_defaults(self):
+        s = agps.Settings.from_env({})
+        self.assertIs(s.map_icon, True)
+        self.assertEqual(s.map_tcp, ("127.0.0.1", 5760))
+
+    def test_map_icon_off(self):
+        self.assertIs(agps.Settings.from_env({"AGPS_MAP_ICON": "0"}).map_icon, False)
+
+    def test_map_tcp_invalid(self):
+        for bad in ("nope", "h:0", "h:x", ":5760"):
+            with self.assertRaises(ValueError) as cm:
+                agps.Settings.from_env({"AGPS_MAP_TCP": bad})
+            self.assertIn("AGPS_MAP_TCP", str(cm.exception))
+
+    def test_map_tcp_custom(self):
+        self.assertEqual(agps.Settings.from_env({"AGPS_MAP_TCP": "10.0.0.2:5761"}).map_tcp, ("10.0.0.2", 5761))
+
 
 if __name__ == "__main__":
     unittest.main()

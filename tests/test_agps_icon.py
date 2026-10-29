@@ -1,3 +1,6 @@
+import socket
+import struct
+import time
 import unittest
 
 from pymavlink.dialects.v20 import ardupilotmega as mavlink
@@ -105,6 +108,63 @@ class FrameTest(unittest.TestCase):
 
         icon = agps.ApproxIcon(boom)
         icon.update(POS, True, True)
+
+
+def wait_for(cond, timeout=2):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return cond()
+
+
+class TcpFrameSenderTest(unittest.TestCase):
+    def listen(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(2)
+        self.addCleanup(srv.close)
+        return srv
+
+    def test_send_is_noop_while_disconnected(self):
+        s = agps.TcpFrameSender("127.0.0.1", 9)
+        self.assertFalse(s.connected)
+        s.send(b"abc")
+
+    def test_real_socket_delivers_and_drains(self):
+        srv = self.listen()
+        s = agps.TcpFrameSender("127.0.0.1", srv.getsockname()[1], retry_s=0.05)
+        s.start()
+        conn, _ = srv.accept()
+        conn.settimeout(2)
+        try:
+            self.assertTrue(wait_for(lambda: s.connected))
+            s.send(b"abc")
+            self.assertEqual(conn.recv(16), b"abc")
+            conn.sendall(b"\x00junk" * 2000)
+            time.sleep(0.1)
+            self.assertTrue(s.connected)
+        finally:
+            conn.close()
+
+    def test_reconnects_after_reset_and_never_raises(self):
+        srv = self.listen()
+        s = agps.TcpFrameSender("127.0.0.1", srv.getsockname()[1], retry_s=0.05)
+        s.start()
+        conn, _ = srv.accept()
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        conn.close()
+        for _ in range(20):
+            s.send(b"x" * 100)
+            time.sleep(0.01)
+        conn2, _ = srv.accept()
+        self.addCleanup(conn2.close)
+        conn2.settimeout(2)
+        self.assertTrue(wait_for(lambda: s.connected))
+        s.send(b"again")
+        buf = b""
+        while b"again" not in buf:
+            buf += conn2.recv(4096)
 
 
 if __name__ == "__main__":

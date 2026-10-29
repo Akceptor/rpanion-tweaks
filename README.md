@@ -284,6 +284,28 @@ Position source, first that applies: the last good fix the service cached on the
 - Short power-offs (under about 4 h). The receiver already has everything. It matters after longer power-offs and after the supercap has drained.
 - Proof of acceptance. The receiver's replies never reach the Pi, so the effect is measured (time to first fix), not confirmed.
 
+### Map icon
+
+Before the first 3D fix, once agps has sent the assist data and has a position, it also shows the vehicle icon on the GCS map at that approximate position. It sends a `GLOBAL_POSITION_INT` from 1/1 over its own second TCP connection to mavlink-router (`AGPS_MAP_TCP`), about 10 times a second at most and at least once a second, and stops at the first 3D fix, when the FC heartbeat is lost, or when the service stops. The message carries no motion, and `alt`/`relative_alt` are copied from the FC's own, so altitude readouts stay steady. One `AGPS: map icon approximate until GPS fix` notice goes out per boot. Nothing in logs or the notice contains coordinates.
+
+| Phase | GCS on UDP 14550 (Lima OFF) | GCS on Lima 14551 (Lima ON) | HUD |
+|---|---|---|---|
+| No fix, assist sent | icon at the real approximate position | icon at Lima's fake point (`to_fake` of it when Lima has an anchor) | `≈ lat lon`, the same point as the map |
+| First 3D fix | QGC keeps the approximate icon until the EKF has a position (seconds), then jumps to the real one | icon barely moves: the first fix maps to the fake point | fix line replaces `≈` |
+
+It never reaches the autopilot: mavlink-router does not forward a 1/1 message back toward the FC (loop rule, the same one Battery 2 relies on), and ArduPilot drops messages carrying its own sysid/compid. agps never sends `GPS_RAW_INT`, `GPS_INPUT`, a GPS origin or home position.
+
+Limits:
+- The icon is up to the accuracy radius (cache 25 km, manual up to 500 km) away from the rover and looks like a real position. Do not navigate by it. It never moves, and the HUD `≈` marks it.
+- Mission Planner may flash to 0,0 for a few ms when the FC's own zero position arrives first.
+- GCS link-quality stats read slightly worse (the 1/1 sequence numbers interleave with the FC's).
+- Rpanion's web UI, logger and the router's tlog also see the approximate position.
+- If agps stops during the approximate phase, QGC keeps the icon frozen.
+
+Rollback: set `AGPS_MAP_ICON=0` in `/etc/agps.env` and `sudo systemctl restart agps`. The HUD line and the status datagram stay.
+
+If mavlink-router restarts, agps logs `FC link lost`, restarts its state machine and reconnects with a 1 to 10 s backoff instead of exiting.
+
 ### Privacy
 
 The cache stores your area (rounded to ~1 km) in `/var/lib/agps/last_fix.json` on the SD card, mode 0600. `AGPS_CACHE=0` turns it off and deletes the file. Injected data goes only to the FC. Logs never contain coordinates.
@@ -332,6 +354,8 @@ Set in `/etc/agps.env` (no spaces around `=`). An invalid number makes the servi
 | `AGPS_APPROX_ALT_M` | `0` | ellipsoid altitude for the manual position |
 | `AGPS_APPROX_ACC_KM` | `50` | accuracy radius of the manual position, 1..500. Use the radius that covers every place the rover may start from, measured from the point you typed |
 | `AGPS_STATUS` | `127.0.0.1:14572` | `host:port` that gets a 1 Hz UDP line `AGPS <cache\|manual> <acc_m> <lat> <lon>` while waiting for the first 3D fix, so the video HUD can show the approximate position used. Empty disables. Invalid exits with status 2. Never logged |
+| `AGPS_MAP_ICON` | `1` | `0` turns the approximate map icon off (HUD line and status datagram are unaffected) |
+| `AGPS_MAP_TCP` | `127.0.0.1:5760` | mavlink-router TCP server for the separate write-only connection that carries the icon. Invalid exits with status 2 |
 | `AGPS_CACHE` | `1` | `0` disables the cache and deletes the file |
 | `AGPS_CACHE_FILE` | `/var/lib/agps/last_fix.json` | |
 | `AGPS_CACHE_MAX_DAYS` | `14` | older cache entries are ignored |
