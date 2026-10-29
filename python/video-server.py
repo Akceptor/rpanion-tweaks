@@ -171,10 +171,10 @@ def crc_x25(data: bytes, crc: int = 0xFFFF) -> int:
 
 
 # msgid -> (CRC_EXTRA, base payload length)
-MAVLINK_MSGS = {1: (124, 31), 147: (154, 36)}
+MAVLINK_MSGS = {1: (124, 31), 24: (24, 30), 147: (154, 36)}
 
 
-# Returns (msgid, compid, payload, sysid) for each valid SYS_STATUS / BATTERY_STATUS frame in buf,
+# Returns (msgid, compid, payload, sysid) for each valid SYS_STATUS / GPS_RAW_INT / BATTERY_STATUS frame in buf,
 # ignoring garbage and everything else
 def parse_mavlink_frames(buf: bytes):
     frames = []
@@ -221,6 +221,13 @@ def decode_battery_status(payload: bytes):
     return payload[32], None if mah == -1 else mah
 
 
+# (fix_type, satellites_visible, eph, lat degE7, lon degE7)
+def decode_gps_raw(payload: bytes):
+    lat, lon = struct.unpack_from("<ii", payload, 8)
+    eph = struct.unpack_from("<H", payload, 20)[0]
+    return payload[28], payload[29], eph, lat, lon
+
+
 # Updates state in place from one parsed frame. Only the autopilot (compid 1) is trusted.
 def apply_mavlink(state: dict, msgid: int, compid: int, payload: bytes, now: float, sysid=None):
     if compid != 1:
@@ -230,6 +237,9 @@ def apply_mavlink(state: dict, msgid: int, compid: int, payload: bytes, now: flo
     if msgid == 1:
         state["volts"], state["amps"], state["pct"] = decode_sys_status(payload)
         state["ts"] = now
+    elif msgid == 24:
+        state["gps"] = decode_gps_raw(payload)
+        state["gps_ts"] = now
     elif msgid == 147:
         batt_id, mah = decode_battery_status(payload)
         if batt_id == 0:
@@ -238,6 +248,25 @@ def apply_mavlink(state: dict, msgid: int, compid: int, payload: bytes, now: flo
 
 def fc_fresh(state: dict, now: float) -> bool:
     return now - state.get("ts", -1e9) <= 5
+
+
+GPS_FIX_NAMES = {0: "NO GPS", 1: "NO FIX", 2: "2D", 3: "3D", 4: "DGPS",
+                 5: "RTK FLT", 6: "RTK FIX", 7: "STATIC", 8: "PPP"}
+
+
+def gps_line(state: dict, now: float) -> str:
+    if "gps" not in state or now - state["gps_ts"] > 5:
+        return ""
+    fix, sats, eph, lat, lon = state["gps"]
+    parts = ["GPS", GPS_FIX_NAMES.get(fix, "FIX{0}".format(fix))]
+    if sats != 255:
+        parts.append("{0} sats".format(sats))
+    if eph != 65535:
+        parts.append("HDOP {0:.1f}".format(eph / 100))
+    lines = [" ".join(parts)]
+    if fix >= 2:
+        lines.append("{0:.6f} {1:.6f}".format(lat / 1e7, lon / 1e7))
+    return "\n".join(lines)
 
 
 def clamp(value: int, lo: int, hi: int) -> int:
@@ -536,6 +565,7 @@ class SystemStats(threading.Thread):
         super().__init__(daemon=True)
         self.lines = ["", ""]
         self.batt_lines = ["", ""]
+        self.gps_text = ""
         self.mavlink = MavlinkBattery(env_number("STATS_MAVLINK_PORT", 14570))
         self.lima = LimaStatus(env_number("STATS_LIMA_PORT", 14571))
         self.ina = Ina226()
@@ -587,6 +617,7 @@ class SystemStats(threading.Thread):
                 net += " | " + slow["signal"]
             self.lines = [net, " | ".join(sys_parts)]
             self.batt_lines = [fc_line(self.mavlink.state, now), self.ina.line(now)]
+            self.gps_text = gps_line(self.mavlink.state, now)
             self.mavlink.send_batt2(self.ina.last, now)
 
 
@@ -598,6 +629,7 @@ def attach_stats(pipeline):
         return None
     battoverlay = pipeline.get_by_name("battoverlay")
     limaoverlay = pipeline.get_by_name("limaoverlay")
+    gpsoverlay = pipeline.get_by_name("gpsoverlay")
 
     stats = SystemStats.get()
     frames = [0]
@@ -624,6 +656,8 @@ def attach_stats(pipeline):
             battoverlay.set_property("text", "\n".join(l for l in stats.batt_lines if l))
         if limaoverlay is not None:
             limaoverlay.set_property("text", lima_line(stats.lima.state, now))
+        if gpsoverlay is not None:
+            gpsoverlay.set_property("text", stats.gps_text)
         return True
 
     return GLib.timeout_add(1000, tick)
@@ -730,6 +764,8 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
             pipeline.append("textoverlay name=battoverlay text=\"\" valignment=bottom halignment=left line-alignment=left "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
             pipeline.append("textoverlay name=limaoverlay text=\"\" valignment=bottom halignment=center "
+                            "font-desc=\"Sans 10\" shaded-background=true ypad=10")
+            pipeline.append("textoverlay name=gpsoverlay text=\"\" valignment=bottom halignment=right line-alignment=right "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
 
         # 3 options for H264: Rpi hardware compression (v4l2h264enc), Jetson hardware compression (nvv4l2h264enc)
