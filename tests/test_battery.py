@@ -517,17 +517,35 @@ class GpsTest(unittest.TestCase):
     def test_no_fix(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(fix=1, sats=0, eph=9999, lat=0, lon=0), 100.0)
-        self.assertEqual(vs.gps_line(st, 101.0), "GPS NO FIX 0 sats HDOP 100.0")
+        self.assertEqual(vs.gps_line(st, 101.0), "GPS NO FIX 0 sats\nHDOP Poor (100.0)")
 
     def test_3d_with_coords(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(), 100.0)
-        self.assertEqual(vs.gps_line(st, 101.0), "GPS 3D 12 sats HDOP 1.2\n50.123457 -30.123457")
+        self.assertEqual(vs.gps_line(st, 101.0), "GPS 3D 12 sats\nHDOP Good (1.2)\n50.123457 -30.123457")
 
     def test_unknown_sats_and_hdop(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(fix=6, sats=255, eph=65535), 100.0)
         self.assertEqual(vs.gps_line(st, 100.0), "GPS RTK FIX\n50.123457 -30.123457")
+
+    def test_hdop_rating_line(self):
+        for eph, text in ((50, "HDOP Excellent (0.5)"), (140, "HDOP Good (1.4)"),
+                          (240, "HDOP Usable (2.4)"), (9999, "HDOP Poor (100.0)")):
+            st = {}
+            vs.apply_mavlink(st, 24, 1, gps_payload(eph=eph), 100.0)
+            self.assertEqual(vs.gps_line(st, 100.0).split("\n")[1], text)
+
+    def test_hdop_rating_boundaries(self):
+        for hdop, rating in ((0.0, "Excellent"), (1.0, "Excellent"), (1.01, "Good"), (2.0, "Good"),
+                             (2.01, "Usable"), (5.0, "Usable"), (5.01, "Poor")):
+            self.assertEqual(vs.hdop_rating(hdop), rating)
+
+    def test_hdop_rating_from_eph_boundaries(self):
+        for eph, rating in ((100, "Excellent"), (200, "Good"), (500, "Usable"), (501, "Poor")):
+            st = {}
+            vs.apply_mavlink(st, 24, 1, gps_payload(eph=eph), 100.0)
+            self.assertIn(rating, vs.gps_line(st, 100.0).split("\n")[1])
 
     def test_unknown_fix_name(self):
         st = {}
@@ -537,7 +555,7 @@ class GpsTest(unittest.TestCase):
     def test_stale(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(), 100.0)
-        self.assertEqual(vs.gps_line(st, 105.0).split("\n")[0], "GPS 3D 12 sats HDOP 1.2")
+        self.assertEqual(vs.gps_line(st, 105.0).split("\n")[0], "GPS 3D 12 sats")
         self.assertEqual(vs.gps_line(st, 105.1), "")
 
     def test_empty(self):

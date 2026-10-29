@@ -274,6 +274,16 @@ GPS_FIX_NAMES = {0: "NO GPS", 1: "NO FIX", 2: "2D", 3: "3D", 4: "DGPS",
                  5: "RTK FLT", 6: "RTK FIX", 7: "STATIC", 8: "PPP"}
 
 
+def hdop_rating(hdop: float) -> str:
+    if hdop <= 1.0:
+        return "Excellent"
+    if hdop <= 2.0:
+        return "Good"
+    if hdop <= 5.0:
+        return "Usable"
+    return "Poor"
+
+
 def gps_line(state: dict, now: float) -> str:
     if "gps" not in state or now - state["gps_ts"] > 5:
         return ""
@@ -281,9 +291,10 @@ def gps_line(state: dict, now: float) -> str:
     parts = ["GPS", GPS_FIX_NAMES.get(fix, "FIX{0}".format(fix))]
     if sats != 255:
         parts.append("{0} sats".format(sats))
-    if eph != 65535:
-        parts.append("HDOP {0:.1f}".format(eph / 100))
     lines = [" ".join(parts)]
+    if eph != 65535:
+        hdop = eph / 100
+        lines.append("HDOP {0} ({1:.1f})".format(hdop_rating(hdop), hdop))
     if fix >= 2:
         lines.append("{0:.6f} {1:.6f}".format(lat / 1e7, lon / 1e7))
     return "\n".join(lines)
