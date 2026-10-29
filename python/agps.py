@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 import datetime
+import json
+import logging
+import math
+import os
 import struct
+import subprocess
+import tempfile
+from typing import NamedTuple
 
 INJECT_MAX = 110
 
@@ -55,3 +62,97 @@ def to_inject(frame):
     if len(frame) > INJECT_MAX:
         raise ValueError("UBX frame too long for one GPS_INJECT_DATA")
     return len(frame), list(frame) + [0] * (INJECT_MAX - len(frame))
+
+
+class Position(NamedTuple):
+    lat: float
+    lon: float
+    alt_m: float
+    acc_m: float
+    source: str
+
+
+def _valid_latlon(lat, lon):
+    return math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180
+
+
+class FixCache:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                d = json.load(f)
+            out = {k: float(d[k]) for k in ("lat", "lon", "alt_m", "t")}
+        except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
+            return None
+        if not all(math.isfinite(v) for v in out.values()) or not _valid_latlon(out["lat"], out["lon"]):
+            return None
+        return out
+
+    def save(self, lat, lon, alt_m, t):
+        d = {"lat": round(lat, 2), "lon": round(lon, 2), "alt_m": alt_m, "t": t}
+        dirname = os.path.dirname(self.path) or "."
+        fd, tmp = tempfile.mkstemp(dir=dirname, prefix=".last_fix.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def delete(self):
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+
+
+def parse_manual(env):
+    raw_lat = env.get("AGPS_APPROX_LAT")
+    raw_lon = env.get("AGPS_APPROX_LON")
+    if raw_lat is None or raw_lon is None:
+        return None
+    try:
+        lat, lon = float(raw_lat), float(raw_lon)
+        alt = float(env.get("AGPS_APPROX_ALT_M", "0"))
+        if not _valid_latlon(lat, lon) or not math.isfinite(alt):
+            raise ValueError
+    except ValueError:
+        logging.warning("agps: invalid AGPS_APPROX_* position ignored")
+        return None
+    return lat, lon, alt
+
+
+def choose_position(cache, manual, now, max_age_s, cache_acc_m, manual_acc_m):
+    if cache is not None and 0 <= now - cache["t"] <= max_age_s:
+        return Position(cache["lat"], cache["lon"], cache["alt_m"], cache_acc_m, "cache")
+    if manual is not None:
+        return Position(manual[0], manual[1], manual[2], manual_acc_m, "manual")
+    return None
+
+
+def ntp_synced(run=subprocess.run):
+    try:
+        r = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "yes"
+
+
+def build_assist(now, time_ok, pos, have_fix):
+    frames = [valset_use_ana()]
+    if have_fix:
+        return frames
+    if time_ok:
+        frames.append(mga_ini_time_utc(now))
+    if pos is not None:
+        frames.append(mga_ini_pos_llh(pos.lat, pos.lon, pos.alt_m, pos.acc_m))
+    return frames
