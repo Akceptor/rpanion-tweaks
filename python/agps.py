@@ -250,6 +250,52 @@ def udp_status_sender(dest):
     return send
 
 
+STATUSTEXT_ICON = b"AGPS: map icon approximate until GPS fix"
+ICON_EVENT_GAP_S = 0.1
+ICON_FLOOR_S = 1
+
+
+class ApproxIcon:
+    def __init__(self, send, clock=time.monotonic):
+        self.send = send
+        self.clock = clock
+        self.mav = mavlink.MAVLink(None, srcSystem=FC[0], srcComponent=FC[1])
+        self.fc_alt = None
+        self.fc_rel_alt = 0
+        self.fc_boot_ms = 0
+        self.last_latlon = None
+        self.last_send = None
+
+    def fc_position(self, m):
+        if self.last_latlon == (m.lat, m.lon):
+            return
+        self.fc_alt, self.fc_rel_alt, self.fc_boot_ms = m.alt, m.relative_alt, m.time_boot_ms
+
+    def frame(self, pos):
+        lat, lon = round(pos.lat * 1e7), round(pos.lon * 1e7)
+        alt = self.fc_alt if self.fc_alt is not None else round(pos.alt_m * 1000)
+        self.last_latlon = (lat, lon)
+        msg = mavlink.MAVLink_global_position_int_message(
+            self.fc_boot_ms, lat, lon, alt, self.fc_rel_alt, 0, 0, 0, 65535)
+        data = msg.pack(self.mav)
+        self.mav.seq = (self.mav.seq + 1) & 0xFF
+        return data
+
+    def update(self, pos, active, event):
+        if not active or pos is None:
+            self.last_send = None
+            return
+        now = self.clock()
+        since = None if self.last_send is None else now - self.last_send
+        if since is not None and not (since >= ICON_FLOOR_S or (event and since >= ICON_EVENT_GAP_S)):
+            return
+        self.last_send = now
+        try:
+            self.send(self.frame(pos))
+        except OSError:
+            pass
+
+
 class Runner:
     def __init__(self, conn, settings, cache, clock=time.monotonic, wall=time.time,
                  ntp=ntp_synced, sleep=time.sleep, status_send=None):
