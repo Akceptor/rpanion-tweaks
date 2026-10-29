@@ -149,6 +149,9 @@ Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then ad
 | `INA226_ADDR` | `0x40` | I2C address |
 | `INA226_SHUNT_OHMS` | `0.1` | Shunt resistance. `0.01` for R010 |
 | `PI_BATT_CELLS` | `2` | Cells in the Pi battery, for the %. `0` hides the % |
+| `PI_MAH_FILE` | `/tmp/pi_batt_mah.json` | Where the consumed mAh is kept, so a video-server restart keeps the count. It resets on Pi reboot (new battery) |
+
+The Pi battery also shows consumed mAh (`PI 7.2V 0.8A 5% 123mAh`) and sends it to the GCS as battery 2 `current_consumed`. While the shunt is R100 the current clips at ~0.82 A, so the count is a lower bound; a trailing `+` (`123mAh+`) means some samples were clipped.
 
 The Pi battery % is a voltage estimate. It sags under load, so expect it to read low while the modem is busy. The table is for LiPo; Li-ion packs will read low.
 
