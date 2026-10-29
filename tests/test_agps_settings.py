@@ -36,6 +36,16 @@ class SettingsTest(unittest.TestCase):
     def test_ignores_unknown_vars(self):
         agps.Settings.from_env({"AGPS_ZTP_TOKEN": "x", "AGPS_OCID_TOKEN": "y"})
 
+    def test_approx_acc_override(self):
+        self.assertEqual(agps.Settings.from_env({"AGPS_APPROX_ACC_KM": "120.5"}).manual_acc_m, 120500)
+
+    def test_approx_acc_invalid_falls_back(self):
+        for bad in ("x", "0.5", "501", "nan", "-3"):
+            with self.assertLogs(level="WARNING") as cm:
+                s = agps.Settings.from_env({"AGPS_APPROX_ACC_KM": bad, "AGPS_APPROX_LAT": "47.5", "AGPS_APPROX_LON": "8.5"})
+            self.assertEqual(s.manual_acc_m, 50000, bad)
+            self.assertNotIn("47.5", "\n".join(cm.output))
+
     def test_manual_passthrough(self):
         s = agps.Settings.from_env({"AGPS_APPROX_LAT": "47.0", "AGPS_APPROX_LON": "8.0", "AGPS_APPROX_ACC_KM": "10"})
         self.assertEqual(s.manual, (47.0, 8.0, 0.0))

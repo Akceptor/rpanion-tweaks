@@ -168,6 +168,17 @@ def _number(env, name, default, scale=1.0):
     return v * scale
 
 
+def _approx_acc_m(env):
+    try:
+        km = float(env.get("AGPS_APPROX_ACC_KM", "50"))
+        if not 1 <= km <= 500:
+            raise ValueError
+    except ValueError:
+        logging.warning("agps: invalid AGPS_APPROX_ACC_KM (want 1..500), using 50")
+        km = 50.0
+    return km * 1000
+
+
 class Settings(NamedTuple):
     enable: bool
     mavlink: str
@@ -190,5 +201,5 @@ class Settings(NamedTuple):
             cache_max_age_s=_number(env, "AGPS_CACHE_MAX_DAYS", "14", 86400),
             cache_acc_m=_number(env, "AGPS_CACHE_ACC_KM", "25", 1000),
             manual=parse_manual(env),
-            manual_acc_m=_number(env, "AGPS_APPROX_ACC_KM", "50", 1000),
+            manual_acc_m=_approx_acc_m(env),
         )
