@@ -324,6 +324,26 @@ Deploy `python/agps.py`, `python/lima.py` and `python/video-server.py` together 
 
 The cache stores your area (rounded to ~1 km) in `/var/lib/agps/last_fix.json` on the SD card, mode 0600. `AGPS_CACHE=0` turns it off and deletes the file. Injected data goes only to the FC. Logs never contain coordinates.
 
+### Optional accounts and tokens
+
+The service needs no account. These tokens are only kept for future features (online AssistNow, cell-tower position) and are ignored today:
+
+| Service | What for | Where to get it |
+|---|---|---|
+| u-blox Thingstream AssistNow (ZTP) | Online orbit data for a fast first-ever fix ("option C", not implemented). The legacy AssistNow Online/Offline tokens are no longer issued. | Sign up at <https://portal.thingstream.io/> → **Services → ZTP → Device Profiles → Create Profile** (chip type `OTHER` for the MAX-M10S, profile type **Evaluation**: 300 requests/month). Copy the **ZTP token** from the profile's Details tab. Endpoint: `https://api.thingstream.io/ztp/assistnow/credentials`. Guides: [getting started](https://support.thingstream.io/hc/en-gb/articles/20837860069788-AssistNow-Getting-Started-Guide), [device registration](https://support.thingstream.io/hc/en-gb/articles/19691380675356-AssistNow-device-registration) |
+| OpenCellID | Offline cell-ID → position lookup (coverage is sparse: check your cell first) | Sign up at <https://opencellid.org/> → API access token (`pk.…`); per-country exports at <https://opencellid.org/downloads.php> |
+
+Save them on the Pi, root-only, without putting them in shell history (run on the Pi; prompts for each value):
+
+```bash
+sudo touch /etc/agps.env && sudo chmod 600 /etc/agps.env
+read -rsp 'Thingstream ZTP token: ' T && echo && printf 'AGPS_ZTP_TOKEN=%s\n' "$T" | sudo tee -a /etc/agps.env >/dev/null; unset T
+read -rsp 'OpenCellID token: ' T && echo && printf 'AGPS_OCID_TOKEN=%s\n' "$T" | sudo tee -a /etc/agps.env >/dev/null; unset T
+sudo grep -c TOKEN /etc/agps.env   # counts lines, doesn't print them
+```
+
+Never commit these values; the repo is public.
+
 ### Install (on the Pi)
 
 `/etc/agps.env` may already exist (with tokens used by other things): edit it, don't overwrite it. The service ignores variables it doesn't know. The script needs `pymavlink` for the system `python3`.
