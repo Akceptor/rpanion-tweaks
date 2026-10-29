@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -186,6 +187,16 @@ def _approx_acc_m(env):
     return km * 1000
 
 
+def _status_addr(env):
+    raw = env.get("AGPS_STATUS", "127.0.0.1:14572")
+    if raw == "":
+        return None
+    host, sep, port = raw.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError("invalid AGPS_STATUS: expected host:port")
+    return host, int(port)
+
+
 class Settings(NamedTuple):
     enable: bool
     mavlink: str
@@ -196,6 +207,7 @@ class Settings(NamedTuple):
     cache_acc_m: float
     manual: object
     manual_acc_m: float
+    status: object
 
     @classmethod
     def from_env(cls, env):
@@ -209,6 +221,7 @@ class Settings(NamedTuple):
             cache_acc_m=_number(env, "AGPS_CACHE_ACC_KM", "25", 1000),
             manual=parse_manual(env),
             manual_acc_m=_approx_acc_m(env),
+            status=_status_addr(env),
         )
 
 
@@ -217,11 +230,28 @@ HEARTBEAT_TIMEOUT_S = 10
 RESEND_AFTER_S = 30
 CACHE_INTERVAL_S = 900
 FRAME_GAP_S = 0.1
+STATUS_INTERVAL_S = 1
+
+
+def status_datagram(pos):
+    return f"AGPS {pos.source} {round(pos.acc_m)} {pos.lat:.5f} {pos.lon:.5f}".encode("ascii")
+
+
+def udp_status_sender(dest):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send(data):
+        try:
+            sock.sendto(data, dest)
+        except OSError:
+            pass
+
+    return send
 
 
 class Runner:
     def __init__(self, conn, settings, cache, clock=time.monotonic, wall=time.time,
-                 ntp=ntp_synced, sleep=time.sleep):
+                 ntp=ntp_synced, sleep=time.sleep, status_send=None):
         self.conn = conn
         self.settings = settings
         self.cache = cache
@@ -229,6 +259,7 @@ class Runner:
         self.wall = wall
         self.ntp = ntp
         self.sleep = sleep
+        self.status_send = status_send
         self.armed = False
         self.last_save = None
         if not settings.cache_enabled:
@@ -243,6 +274,8 @@ class Runner:
         self.sent_t = None
         self.sent_count = 0
         self.fix_at_detect = False
+        self.chosen_pos = None
+        self.status_t = None
 
     def handle(self, m):
         if m.get_srcSystem() != FC[0] or m.get_srcComponent() != FC[1]:
@@ -289,6 +322,10 @@ class Runner:
             self.send_bundle(self.good_fix)
             self.sent_count = 2
             self.sent_t = now
+        if self.state == "SENT" and self.status_send and self.chosen_pos is not None and (
+                self.status_t is None or now - self.status_t >= STATUS_INTERVAL_S):
+            self.status_send(status_datagram(self.chosen_pos))
+            self.status_t = now
 
     def send_bundle(self, have_fix):
         wall = self.wall()
@@ -297,6 +334,7 @@ class Runner:
         if not have_fix:
             cached = self.cache.load() if s.cache_enabled else None
             pos = choose_position(cached, s.manual, wall, s.cache_max_age_s, s.cache_acc_m, s.manual_acc_m)
+        self.chosen_pos = pos
         time_ok = (not have_fix) and self.ntp()
         now = datetime.datetime.fromtimestamp(wall, datetime.timezone.utc)
         frames = build_assist(now, time_ok, pos, have_fix)
@@ -361,7 +399,8 @@ def main(argv=None, env=os.environ, connect=None):
     cache = FixCache(settings.cache_file)
 
     if cmd == "run":
-        runner = Runner(conn, settings, cache)
+        send = udp_status_sender(settings.status) if settings.status else None
+        runner = Runner(conn, settings, cache, status_send=send)
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())

@@ -68,6 +68,7 @@ Don't send `CFG-ANA-ORBMAXERR` (`0x30230002`, U2 m, 5–1000, default 100). u-bl
 | `AGPS_APPROX_LAT`, `AGPS_APPROX_LON` | unset | manual coarse position, only in `/etc/agps.env` |
 | `AGPS_APPROX_ALT_M` | `0` | ellipsoid altitude for manual |
 | `AGPS_APPROX_ACC_KM` | `50` | posAcc for manual; valid 1..500, invalid → default with a log line |
+| `AGPS_STATUS` | `127.0.0.1:14572` | `host:port` for a 1 Hz UDP status line `AGPS <source> <acc_m> <lat> <lon>` while SENT (bundle sent, no 3D fix) and a position was chosen; empty disables; invalid → exit 2. Coordinates go only there, never to logs |
 | `AGPS_CACHE` | `1` | `0` → no cache, delete file |
 | `AGPS_CACHE_FILE` | `/var/lib/agps/last_fix.json` | |
 | `AGPS_CACHE_MAX_DAYS` | `14` | |

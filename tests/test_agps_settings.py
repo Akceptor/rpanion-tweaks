@@ -18,6 +18,19 @@ class SettingsTest(unittest.TestCase):
         self.assertIsNone(s.manual)
         self.assertEqual(s.manual_acc_m, 50000)
 
+    def test_status_default_and_override(self):
+        self.assertEqual(agps.Settings.from_env({}).status, ("127.0.0.1", 14572))
+        self.assertEqual(agps.Settings.from_env({"AGPS_STATUS": "10.0.0.2:9"}).status, ("10.0.0.2", 9))
+
+    def test_status_empty_disables(self):
+        self.assertIsNone(agps.Settings.from_env({"AGPS_STATUS": ""}).status)
+
+    def test_status_invalid(self):
+        for bad in ("nope", "host:", ":1", "h:0", "h:70000", "h:x"):
+            with self.assertRaises(ValueError, msg=bad) as cm:
+                agps.Settings.from_env({"AGPS_STATUS": bad})
+            self.assertIn("AGPS_STATUS", str(cm.exception))
+
     def test_disable(self):
         self.assertFalse(agps.Settings.from_env({"AGPS_ENABLE": "0"}).enable)
 

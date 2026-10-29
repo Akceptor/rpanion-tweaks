@@ -50,7 +50,7 @@ class RunnerBase(unittest.TestCase):
         self.t = 0.0
         self.ntp_ok = True
 
-    def make(self, env=None):
+    def make(self, env=None, status=True):
         e = dict(MANUAL_ENV)
         e["AGPS_CACHE_FILE"] = self.cache_path
         e.update(env or {})
@@ -65,8 +65,10 @@ class RunnerBase(unittest.TestCase):
             orig(*a)
 
         cache.save = save
+        self.status = []
+        send = (lambda data: self.status.append((self.t, data))) if status else None
         return agps.Runner(self.conn, s, cache, clock=lambda: self.t, wall=lambda: 1_800_000_000.0 + self.t,
-                           ntp=lambda: self.ntp_ok, sleep=lambda s: None)
+                           ntp=lambda: self.ntp_ok, sleep=lambda s: None, status_send=send)
 
     @property
     def calls(self):
@@ -189,6 +191,88 @@ class RunnerTest(RunnerBase):
         self.assertIn("first 3D fix 40s after GPS detected", text)
         self.assertIn("pos=manual", text)
         for bad in ("47.0", "470000000", "8.0"):
+            self.assertNotIn(bad, text)
+
+
+class StatusTest(RunnerBase):
+    def settle(self, r):
+        self.at(0, r, heartbeat(), gps(1))
+        self.at(15, r)
+
+    def test_manual_datagram_format(self):
+        r = self.make({"AGPS_APPROX_LAT": "47.123456", "AGPS_APPROX_LON": "-8.5", "AGPS_APPROX_ACC_KM": "50"})
+        self.settle(r)
+        self.assertEqual(self.status[0][1], b"AGPS manual 50000 47.12346 -8.50000")
+
+    def test_cache_datagram_format(self):
+        r = self.make()
+        self.at(0, r, heartbeat(), gps(3))
+        self.at(1, r, gps(3))
+        self.assertTrue(os.path.exists(self.cache_path))
+        r2 = self.make({"AGPS_CACHE_ACC_KM": "25.4"})
+        self.at(0, r2, heartbeat(), gps(1))
+        self.at(15, r2)
+        self.assertEqual(self.status[0][1], b"AGPS cache 25400 47.00000 8.00000")
+
+    def test_one_hz_while_sent(self):
+        r = self.make()
+        self.settle(r)
+        for t in (15.4, 15.9):
+            self.at(t, r, hb=False)
+        self.at(16, r, hb=False)
+        self.at(16.5, r, hb=False)
+        self.at(17, r, hb=False)
+        self.assertEqual([t for t, _ in self.status], [15, 16, 17])
+
+    def test_stops_after_fix(self):
+        r = self.make()
+        self.settle(r)
+        self.at(16, r, gps(3))
+        self.assertEqual(r.state, "DONE")
+        n = len(self.status)
+        self.at(30, r, hb=False)
+        self.at(40, r, hb=False)
+        self.assertEqual(len(self.status), n)
+
+    def test_stops_after_restart(self):
+        r = self.make()
+        self.settle(r)
+        self.at(40, r, hb=False)
+        self.assertEqual(r.state, "WAIT_GPS")
+        n = len(self.status)
+        self.at(50, r, hb=False)
+        self.assertEqual(len(self.status), n)
+
+    def test_nothing_without_position(self):
+        r = self.make(env={"AGPS_CACHE": "0"})
+        r.settings = r.settings._replace(manual=None)
+        self.settle(r)
+        self.at(20, r, hb=False)
+        self.assertEqual(self.status, [])
+
+    def test_nothing_when_fix_already_present(self):
+        r = self.make()
+        self.at(0, r, heartbeat(), gps(3))
+        self.at(15, r)
+        self.assertEqual(r.state, "SENT")
+        self.at(20, r, hb=False)
+        self.assertEqual(self.status, [])
+
+    def test_disabled_without_sender(self):
+        r = self.make(status=False)
+        self.settle(r)
+        self.at(20, r, hb=False)
+        self.assertEqual(self.status, [])
+
+    def test_logs_have_no_coordinates(self):
+        r = self.make({"AGPS_APPROX_LAT": "47.123456", "AGPS_APPROX_LON": "8.654321"})
+        with self.assertLogs(level=logging.INFO) as cm:
+            self.settle(r)
+            self.at(20, r, hb=False)
+            self.at(40, r, gps(3))
+        self.assertTrue(self.status)
+        text = "\n".join(cm.output)
+        for bad in ("47.1", "8.65", "471234", "86543"):
             self.assertNotIn(bad, text)
 
 

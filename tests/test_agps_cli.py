@@ -54,6 +54,12 @@ class CliTest(unittest.TestCase):
         self.assertIn("AGPS_SETTLE_S", err)
         self.assertEqual(connects, [])
 
+    def test_bad_status_exits_2(self):
+        rc, _, err, connects = run_main([], {"AGPS_STATUS": "nope"})
+        self.assertEqual(rc, 2)
+        self.assertIn("AGPS_STATUS", err)
+        self.assertEqual(connects, [])
+
     def test_connect_arguments(self):
         rc, _, _, connects = run_main(["probe"], {}, QueueConn([heartbeat(), statustext("u-blox 1 HW: 000A0000")]))
         (args, kwargs), = connects

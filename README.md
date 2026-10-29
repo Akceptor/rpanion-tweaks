@@ -326,6 +326,7 @@ Set in `/etc/agps.env` (no spaces around `=`). An invalid number makes the servi
 | `AGPS_APPROX_LAT`, `AGPS_APPROX_LON` | unset | manual coarse position |
 | `AGPS_APPROX_ALT_M` | `0` | ellipsoid altitude for the manual position |
 | `AGPS_APPROX_ACC_KM` | `50` | accuracy radius of the manual position, 1..500. Use the radius that covers every place the rover may start from, measured from the point you typed |
+| `AGPS_STATUS` | `127.0.0.1:14572` | `host:port` that gets a 1 Hz UDP line `AGPS <cache\|manual> <acc_m> <lat> <lon>` while waiting for the first 3D fix, so the video HUD can show the approximate position used. Empty disables. Invalid exits with status 2. Never logged |
 | `AGPS_CACHE` | `1` | `0` disables the cache and deletes the file |
 | `AGPS_CACHE_FILE` | `/var/lib/agps/last_fix.json` | |
 | `AGPS_CACHE_MAX_DAYS` | `14` | older cache entries are ignored |
