@@ -67,7 +67,7 @@ Don't send `CFG-ANA-ORBMAXERR` (`0x30230002`, U2 m, 5–1000, default 100). u-bl
 | `AGPS_SETTLE_S` | `15` | wait after GPS detected |
 | `AGPS_APPROX_LAT`, `AGPS_APPROX_LON` | unset | manual coarse position, only in `/etc/agps.env` |
 | `AGPS_APPROX_ALT_M` | `0` | ellipsoid altitude for manual |
-| `AGPS_APPROX_ACC_KM` | `50` | posAcc for manual |
+| `AGPS_APPROX_ACC_KM` | `50` | posAcc for manual; valid 1..500, invalid → default with a log line |
 | `AGPS_CACHE` | `1` | `0` → no cache, delete file |
 | `AGPS_CACHE_FILE` | `/var/lib/agps/last_fix.json` | |
 | `AGPS_CACHE_MAX_DAYS` | `14` | |
@@ -78,9 +78,13 @@ Don't send `CFG-ANA-ORBMAXERR` (`0x30230002`, U2 m, 5–1000, default 100). u-bl
 
 The receiver's MGA-ACK and ACK-ACK replies come back on the GPS UART. ArduPilot's parser ignores them and doesn't forward them, so acceptance can't be seen from the Pi. What can be seen: ArduPilot parses MON-VER replies and sends STATUSTEXT `u-blox [MOD ]1 HW: <hw> SW: <sw>`. A MON-VER poll injected by us that produces a fresh STATUSTEXT proves the inject path works end to end (the spike). After that, effectiveness is measured, not confirmed: TTFF in the journal, on/off, over several runs. To read `NAV-AOPSTATUS`/`CFG-ANA` directly, connect u-center through ArduPilot serial passthrough (`SERIAL_PASS1/2`) from a laptop on FC USB (optional; unverified here).
 
+## Verified by the spike (Task 0)
+
+An injected MON-VER poll (`GPS_INJECT_DATA` as 1/193 over `tcp:127.0.0.1:5760`) produced STATUSTEXT `u-blox 1 HW: 000A0000 SW: ROM SPG 5.10 (7b202e)` within 0.04 s. The control run without the inject produced no STATUSTEXT in 8 s. So the inject path reaches the receiver, and the firmware is SPG 5.10, so the key IDs from UBX-21035062 apply.
+
 ## Unverified
 
-- Foxeer M10Q firmware is SPG 5.10 (the spike's MON-VER shows `SW:`), and supercap hold time.
+- Supercap hold time.
 - No published posAcc upper limit for the M10. 25 and 50 km are engineering choices.
 - leapSecs 18 still current (no leap second announced as of writing; check IERS Bulletin C).
 - The FC runs ArduPilot 4.6-era u-blox code. Checked: Rover-4.6.3 and master.
