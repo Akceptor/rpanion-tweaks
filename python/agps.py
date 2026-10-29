@@ -7,7 +7,10 @@ import os
 import struct
 import subprocess
 import tempfile
+import time
 from typing import NamedTuple
+
+from pymavlink.dialects.v20 import ardupilotmega as mavlink
 
 INJECT_MAX = 110
 
@@ -203,3 +206,100 @@ class Settings(NamedTuple):
             manual=parse_manual(env),
             manual_acc_m=_approx_acc_m(env),
         )
+
+
+FC = (1, 1)
+HEARTBEAT_TIMEOUT_S = 10
+RESEND_AFTER_S = 30
+CACHE_INTERVAL_S = 900
+FRAME_GAP_S = 0.1
+
+
+class Runner:
+    def __init__(self, conn, settings, cache, clock=time.monotonic, wall=time.time,
+                 ntp=ntp_synced, sleep=time.sleep):
+        self.conn = conn
+        self.settings = settings
+        self.cache = cache
+        self.clock = clock
+        self.wall = wall
+        self.ntp = ntp
+        self.sleep = sleep
+        self.armed = False
+        self.last_save = None
+        if not settings.cache_enabled:
+            cache.delete()
+        self._restart()
+
+    def _restart(self):
+        self.state = "WAIT_GPS"
+        self.last_hb = None
+        self.good_fix = False
+        self.t_detect = None
+        self.sent_t = None
+        self.sent_count = 0
+        self.fix_at_detect = False
+
+    def handle(self, m):
+        if m.get_srcSystem() != FC[0] or m.get_srcComponent() != FC[1]:
+            return
+        kind = m.get_type()
+        if kind == "HEARTBEAT":
+            now = self.clock()
+            if self.last_hb is not None and now - self.last_hb > HEARTBEAT_TIMEOUT_S:
+                self._restart()
+            self.last_hb = now
+            self.armed = bool(m.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        elif kind == "GPS_RAW_INT":
+            self._on_gps(m)
+
+    def _on_gps(self, m):
+        now = self.clock()
+        self.good_fix = m.fix_type >= 3 and m.lat != 0 and m.lon != 0
+        if self.state == "WAIT_GPS" and m.fix_type >= 1:
+            self.state = "SETTLING"
+            self.t_detect = now
+            self.fix_at_detect = self.good_fix
+        if not self.good_fix:
+            return
+        if self.state == "SENT":
+            self.state = "DONE"
+            if not self.fix_at_detect:
+                logging.info("agps: first 3D fix %ds after GPS detected", round(now - self.t_detect))
+        if self.settings.cache_enabled and (self.last_save is None or now - self.last_save >= CACHE_INTERVAL_S):
+            alt = getattr(m, "alt_ellipsoid", 0) or m.alt
+            self.cache.save(m.lat / 1e7, m.lon / 1e7, alt / 1000.0, self.wall())
+            self.last_save = now
+
+    def tick(self):
+        now = self.clock()
+        if self.last_hb is not None and now - self.last_hb > HEARTBEAT_TIMEOUT_S and self.state != "WAIT_GPS":
+            self._restart()
+            return
+        if self.state == "SETTLING" and now - self.t_detect >= self.settings.settle_s:
+            self.send_bundle(self.good_fix)
+            self.state = "SENT"
+            self.sent_t = now
+            self.sent_count = 1
+        elif self.state == "SENT" and self.sent_count == 1 and now - self.sent_t >= RESEND_AFTER_S:
+            self.send_bundle(self.good_fix)
+            self.sent_count = 2
+            self.sent_t = now
+
+    def send_bundle(self, have_fix):
+        wall = self.wall()
+        s = self.settings
+        pos = None
+        if not have_fix:
+            cached = self.cache.load() if s.cache_enabled else None
+            pos = choose_position(cached, s.manual, wall, s.cache_max_age_s, s.cache_acc_m, s.manual_acc_m)
+        time_ok = (not have_fix) and self.ntp()
+        now = datetime.datetime.fromtimestamp(wall, datetime.timezone.utc)
+        frames = build_assist(now, time_ok, pos, have_fix)
+        for i, frame in enumerate(frames):
+            if i:
+                self.sleep(FRAME_GAP_S)
+            n, data = to_inject(frame)
+            self.conn.mav.gps_inject_data_send(FC[0], FC[1], n, data)
+        parts = ["valset"] + (["time"] if time_ok else []) + ([f"pos={pos.source}"] if pos else [])
+        logging.info("agps: sent %s", ",".join(parts))
