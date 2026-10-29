@@ -852,25 +852,72 @@ class HudLimaCoordsTests(unittest.TestCase):
         out = vs.gps_line(st, 100.0, self.anchor().to_fake)
         self.assertEqual(out.split("\n")[2], "-11.990000 -77.000000")
 
-    def test_approx_line_only_without_fix(self):
-        ap = ("cache", 25000, 50.5, 24.25)
+    def test_apply_lima_new_and_old_format(self):
+        st = {}
+        vs.apply_lima(st, b"LIMA 1 -12.07000 -77.04350", 100.0)
+        self.assertTrue(vs.lima_on(st, 100.0))
+        self.assertEqual(vs.lima_fake(st, 100.0), (-12.07, -77.0435))
+        vs.apply_lima(st, b"LIMA 0 -12.07000 -77.04350", 101.0)
+        self.assertFalse(vs.lima_on(st, 101.0))
+        st = {}
+        vs.apply_lima(st, b"LIMA 1", 100.0)
+        self.assertTrue(vs.lima_on(st, 100.0))
+        self.assertIsNone(vs.lima_fake(st, 100.0))
+        self.assertIsNone(vs.lima_fake(st, 103.1))
+
+    def test_apply_lima_malformed_ignored(self):
+        for bad in (b"LIMA 1 x y", b"LIMA 1 -91 0", b"LIMA 1 0 181", b"LIMA 1 nan 0", b"LIMA 2 0 0",
+                    b"LIMA 1 5", b"LIMA 1 1 2 3", b"LIMA", b"\xff", b"XIMA 1 0 0"):
+            st = {}
+            vs.apply_lima(st, bad, 100.0)
+            self.assertEqual(st, {}, bad)
+
+    def test_approx_display(self):
+        ap = ("cache", 25000, 50.01, 24.0)
+        fake = (-12.07, -77.0435)
+        self.assertEqual(vs.approx_display(ap, False, None, None), (50.01, 24.0))
+        self.assertEqual(vs.approx_display(ap, False, self.anchor(), fake), (50.01, 24.0))
+        self.assertEqual(vs.approx_display(ap, True, self.anchor(), fake), self.anchor().to_fake(50.01, 24.0))
+        self.assertEqual(vs.approx_display(ap, True, None, fake), fake)
+        self.assertIsNone(vs.approx_display(ap, True, None, None))
+        self.assertIsNone(vs.approx_display(None, False, None, None))
+        self.assertIsNone(vs.approx_display(None, True, None, fake))
+
+    def test_approx_line_format(self):
+        self.assertEqual(vs.approx_line((-12.07, -77.0435)), "≈ -12.07 -77.04")
+        self.assertEqual(vs.approx_line((50.5, 24.25)), "≈ 50.50 24.25")
+        for bad in ("±", "km", "cache", "manual"):
+            self.assertNotIn(bad, vs.approx_line((50.5, 24.25)))
+
+    def test_approx_only_without_fix(self):
+        ap = (50.5, 24.25)
         st = self.gps_state(fix=1)
-        self.assertEqual(vs.gps_line(st, 100.0, IDENT, ap).split("\n")[-1], "≈ 50.50 24.25 (cache ±25 km)")
+        self.assertEqual(vs.gps_line(st, 100.0, IDENT, ap).split("\n")[-1], "≈ 50.50 24.25")
+        self.assertEqual(vs.gps_line(self.gps_state(fix=0), 100.0, IDENT, ap).split("\n")[-1], "≈ 50.50 24.25")
         self.assertEqual(vs.gps_line(self.gps_state(fix=3), 100.0, IDENT, ap).count("≈"), 0)
         self.assertEqual(vs.gps_line(self.gps_state(fix=2), 100.0, IDENT, ap).count("≈"), 0)
         self.assertEqual(vs.gps_line(st, 100.0, IDENT, None).count("≈"), 0)
 
-    def test_approx_line_km_rounding(self):
-        st = self.gps_state(fix=0)
-        self.assertTrue(vs.gps_line(st, 100.0, IDENT, ("manual", 200, 1.0, 2.0)).endswith("(manual ±1 km)"))
-        self.assertTrue(vs.gps_line(st, 100.0, IDENT, ("manual", 1600, 1.0, 2.0)).endswith("(manual ±2 km)"))
-
-    def test_approx_line_shifted_and_hidden(self):
+    def test_approx_shown_even_when_coordinates_hidden(self):
         st = self.gps_state(fix=1)
-        ap = ("cache", 25000, 50.01, 24.0)
-        self.assertEqual(vs.gps_line(st, 100.0, self.anchor().to_fake, ap).split("\n")[-1], "≈ -11.99 -77.00 (cache ±25 km)")
-        self.assertEqual(vs.gps_line(st, 100.0, None, ap).split("\n")[-1], "≈ cache ±25 km")
+        self.assertEqual(vs.gps_line(st, 100.0, None, (-12.07, -77.0435)).split("\n")[-1], "≈ -12.07 -77.04")
 
+    def test_fix_coords_never_use_fake_point(self):
+        st = {}
+        vs.apply_lima(st, b"LIMA 1 -12.07000 -77.04350", 100.0)
+        coord = vs.coord_policy(vs.lima_on(st, 100.0), None)
+        self.assertIsNone(coord)
+        out = vs.gps_line(self.gps_state(fix=3), 100.0, coord, None)
+        self.assertEqual(out, "GPS 3D 12 sats\nHDOP Good (1.2)")
+
+    def test_approx_hidden_when_fake_unknown(self):
+        st = {}
+        vs.apply_lima(st, b"LIMA 1", 100.0)
+        ap = ("cache", 25000, 47.0, 8.0)
+        latlon = vs.approx_display(ap, vs.lima_on(st, 100.0), None, vs.lima_fake(st, 100.0))
+        out = vs.gps_line(self.gps_state(fix=1), 100.0, vs.coord_policy(True, None), latlon)
+        self.assertEqual(out.count("≈"), 0)
+        self.assertNotIn("47", out)
 
 if __name__ == "__main__":
     unittest.main()

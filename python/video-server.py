@@ -287,17 +287,11 @@ def hdop_rating(hdop: float) -> str:
     return "Poor"
 
 
-def approx_line(approx, coord) -> str:
-    source, acc_m, lat, lon = approx
-    km = max(1, round(acc_m / 1000))
-    if coord is None:
-        return "≈ {0} ±{1} km".format(source, km)
-    lat, lon = coord(lat, lon)
-    return "≈ {0:.2f} {1:.2f} ({2} ±{3} km)".format(lat, lon, source, km)
+def approx_line(latlon) -> str:
+    return "≈ {0:.2f} {1:.2f}".format(*latlon)
 
 
-# coord: (lat, lon) -> (lat, lon), or None to hide coordinates. approx: fresh AGPS tuple or None
-def gps_line(state: dict, now: float, coord, approx=None) -> str:
+def gps_line(state: dict, now: float, coord, approx_latlon=None) -> str:
     if "gps" not in state or now - state["gps_ts"] > 5:
         return ""
     fix, sats, eph, lat, lon = state["gps"]
@@ -311,8 +305,8 @@ def gps_line(state: dict, now: float, coord, approx=None) -> str:
     if fix >= 2:
         if coord is not None:
             lines.append("{0:.6f} {1:.6f}".format(*coord(lat / 1e7, lon / 1e7)))
-    elif approx is not None:
-        lines.append(approx_line(approx, coord))
+    elif approx_latlon is not None:
+        lines.append(approx_line(approx_latlon))
     return "\n".join(lines)
 
 
@@ -463,10 +457,31 @@ class MavlinkBattery(threading.Thread):
         self.sender.send(frame)
 
 
+# "LIMA <0|1>" (older Lima, no fake point) or "LIMA <0|1> <fake_lat> <fake_lon>"
+def parse_lima(data: bytes):
+    try:
+        parts = data.decode("ascii").split()
+        if parts[0] != "LIMA" or parts[1] not in ("0", "1") or len(parts) not in (2, 4):
+            return None
+        fake = None
+        if len(parts) == 4:
+            fake = (float(parts[2]), float(parts[3]))
+            if not (math.isfinite(fake[0]) and math.isfinite(fake[1])) or abs(fake[0]) > 90 or abs(fake[1]) > 180:
+                return None
+    except (ValueError, IndexError):
+        return None
+    return parts[1] == "1", fake
+
+
 def apply_lima(state: dict, data: bytes, now: float):
-    if data in (b"LIMA 0", b"LIMA 1"):
-        state["on"] = data == b"LIMA 1"
+    parsed = parse_lima(data)
+    if parsed:
+        state["on"], state["fake"] = parsed
         state["ts"] = now
+
+
+def lima_fake(state: dict, now: float):
+    return state.get("fake") if lima_on(state, now) else None
 
 
 def lima_on(state: dict, now: float) -> bool:
@@ -542,6 +557,19 @@ def agps_approx(state: dict, now: float):
     if "agps" in state and now - state["ts"] <= 3:
         return state["agps"]
     return None
+
+
+# The point the GCS map shows before the fix. Lima ON with neither an anchor nor a known fake
+# point returns None: hide it rather than print the real approximate position.
+def approx_display(approx, on: bool, anchor, fake):
+    if approx is None:
+        return None
+    _, _, lat, lon = approx
+    if not on:
+        return (lat, lon)
+    if anchor is not None:
+        return anchor.to_fake(lat, lon)
+    return fake
 
 
 class AgpsStatus(threading.Thread):
@@ -833,8 +861,9 @@ class SystemStats(threading.Thread):
             self.lines = [net, " | ".join(sys_parts)]
             self.batt_lines = [fc_line(self.mavlink.state, now), self.ina.line(now)]
             anchor = load_anchor(self.anchor_path)
-            coord = coord_policy(lima_on(self.lima.state, now), anchor)
-            self.gps_text = gps_line(self.mavlink.state, now, coord, agps_approx(self.agps.state, now))
+            on = lima_on(self.lima.state, now)
+            approx = approx_display(agps_approx(self.agps.state, now), on, anchor, lima_fake(self.lima.state, now))
+            self.gps_text = gps_line(self.mavlink.state, now, coord_policy(on, anchor), approx)
             self.uptime_text = format_uptime(read_uptime())
             self.mavlink.send_batt2(self.ina.last, now)
 

@@ -199,19 +199,23 @@ class NetTest(unittest.TestCase):
                 return
             seen.append(data)
 
+    def test_status_datagram_format(self):
+        self.assertEqual(lima.status_datagram(True, (-12.07, -77.0435)), b"LIMA 1 -12.07000 -77.04350")
+        self.assertEqual(lima.status_datagram(False, (-12.07, -77.0435)), b"LIMA 0 -12.07000 -77.04350")
+
     def test_status_follows_peer(self):
-        self.wait_status(b"LIMA 0")
+        self.wait_status(lima.status_datagram(False, FAKE))
         self.connect(self.gcs)
-        self.wait_status(b"LIMA 1")
+        self.wait_status(lima.status_datagram(True, FAKE))
         self.now[0] += 5.5
         self.router_pump()
-        self.wait_status(b"LIMA 0")
+        self.wait_status(lima.status_datagram(False, FAKE))
 
     def test_status_repeats_each_second(self):
-        self.wait_status(b"LIMA 0")
+        self.wait_status(lima.status_datagram(False, FAKE))
         self.assert_silent(self.status)
         self.now[0] += 1.1
-        self.wait_status(b"LIMA 0")
+        self.wait_status(lima.status_datagram(False, FAKE))
 
     def test_status_unreachable_does_not_stop_proxy(self):
         self.status.close()

@@ -1,7 +1,9 @@
 import contextlib
 import io
+import logging
 import threading
 import unittest
+from unittest import mock
 
 from pymavlink.dialects.v20 import ardupilotmega as mavlink
 
@@ -113,6 +115,154 @@ class CliTest(unittest.TestCase):
 
         agps.serve(conn, R(), stop)
         self.assertEqual(calls, ["HEARTBEAT", "tick", "GPS_RAW_INT", "tick", "tick"])
+
+    def test_bad_map_tcp_exits_2(self):
+        rc, _, err, connects = run_main([], {"AGPS_MAP_TCP": "nope"})
+        self.assertEqual(rc, 2)
+        self.assertIn("AGPS_MAP_TCP", err)
+        self.assertEqual(connects, [])
+
+    def run_with_fake_sender(self, env):
+        built, runners = [], []
+
+        class FakeSender:
+            def __init__(self, host, port):
+                built.append((host, port, self))
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def send(self, frame):
+                pass
+
+        stop = threading.Event()
+        conn = QueueConn([], on_empty=stop.set)
+        orig_runner = agps.Runner
+
+        def runner_factory(*a, **k):
+            r = orig_runner(*a, **k)
+            runners.append(r)
+            return r
+
+        with mock.patch.object(agps, "TcpFrameSender", FakeSender), \
+                mock.patch.object(agps, "Runner", runner_factory), \
+                mock.patch.object(agps.threading, "Event", lambda: stop):
+            rc, _, _, connects = run_main([], dict(env, AGPS_CACHE="0"), conn)
+        self.assertEqual(rc, 0)
+        return built, runners, connects
+
+    def test_run_builds_icon_on_separate_connection(self):
+        built, runners, connects = self.run_with_fake_sender({})
+        (host, port, sender), = built
+        self.assertEqual((host, port), ("127.0.0.1", 5760))
+        self.assertTrue(sender.started)
+        self.assertIsNotNone(runners[0].icon)
+        (args, kwargs), = connects
+        self.assertEqual(kwargs["source_component"], 193)
+
+    def test_map_icon_off_builds_nothing(self):
+        built, runners, connects = self.run_with_fake_sender({"AGPS_MAP_ICON": "0"})
+        self.assertEqual(built, [])
+        self.assertIsNone(runners[0].icon)
+        self.assertEqual(len(connects), 1)
+
+    def test_serve_reconnects_after_reset(self):
+        stop = threading.Event()
+        events = []
+
+        class Dead:
+            def recv_match(self, **k):
+                raise ConnectionResetError(104, "Connection reset by peer")
+
+        new = QueueConn([gps(3)], on_empty=stop.set)
+
+        class R:
+            conn = None
+
+            def handle(self, m):
+                events.append(m.get_type())
+
+            def tick(self):
+                pass
+
+            def link_lost(self):
+                events.append("lost")
+
+        r = R()
+        waits = []
+        with self.assertLogs(level=logging.WARNING) as cm:
+            agps.serve(Dead(), r, stop, reconnect=lambda: new, wait=waits.append)
+        self.assertEqual(events, ["lost", "GPS_RAW_INT"])
+        self.assertIs(r.conn, new)
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(len(cm.output), 1)
+        self.assertNotIn("Traceback", cm.output[0])
+
+    def test_serve_backs_off_while_reconnect_fails(self):
+        stop = threading.Event()
+
+        class Dead:
+            def recv_match(self, **k):
+                raise BrokenPipeError()
+
+        class R:
+            conn = None
+
+            def handle(self, m):
+                pass
+
+            def tick(self):
+                pass
+
+            def link_lost(self):
+                pass
+
+        attempts = []
+        new = QueueConn([], on_empty=stop.set)
+
+        def reconnect():
+            attempts.append(1)
+            if len(attempts) < 4:
+                raise ConnectionRefusedError()
+            return new
+
+        waits = []
+        with self.assertLogs(level=logging.WARNING):
+            agps.serve(Dead(), R(), stop, reconnect=reconnect, wait=waits.append)
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(waits, sorted(waits))
+        self.assertLessEqual(max(waits), 10)
+
+    def test_serve_tick_error_also_reconnects(self):
+        stop = threading.Event()
+        new = QueueConn([], on_empty=stop.set)
+        lost = []
+
+        class R:
+            conn = None
+
+            def handle(self, m):
+                pass
+
+            def tick(self):
+                if not lost:
+                    raise BrokenPipeError()
+
+            def link_lost(self):
+                lost.append(1)
+
+        with self.assertLogs(level=logging.WARNING):
+            agps.serve(QueueConn([heartbeat()]), R(), stop, reconnect=lambda: new, wait=lambda s: None)
+        self.assertEqual(lost, [1])
+
+    def test_serve_without_reconnect_propagates(self):
+        class Dead:
+            def recv_match(self, **k):
+                raise ConnectionResetError()
+
+        with self.assertRaises(ConnectionResetError):
+            agps.serve(Dead(), object(), threading.Event())
 
 
 if __name__ == "__main__":

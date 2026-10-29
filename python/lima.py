@@ -296,6 +296,15 @@ class Rewriter:
                 return None
             lat_f, lon_f, scale = self._command_fields(msg)
         if self.anchor is None:
+            if to_fake and name == "GLOBAL_POSITION_INT":
+                msg.lat = round(self.fake_anchor[0] * 1e7)
+                msg.lon = round(self.fake_anchor[1] * 1e7)
+                return repack(msg, self._out)
+            if to_fake and name in ("GPS_RAW_INT", "GPS2_RAW"):
+                # Zeroed, not dropped: a GCS that gets no GPS_RAW_INT shows "No GPS" instead of "No Fix".
+                setattr(msg, lat_f, 0)
+                setattr(msg, lon_f, 0)
+                return repack(msg, self._out)
             if not to_fake:
                 self._warn(name, "no anchor")
             return None
@@ -320,20 +329,17 @@ class Rewriter:
         return repack(msg, self._out)
 
     def _track(self, msg):
-        name = msg.get_type()
-        if name == "GLOBAL_POSITION_INT":
-            ok = msg.lat != 0 or msg.lon != 0
-        elif name == "GPS_RAW_INT":
-            ok = msg.fix_type >= 3 and (msg.lat != 0 or msg.lon != 0)
-        else:
+        # GLOBAL_POSITION_INT may be agps's approximate spoof, so it must never feed the
+        # anchor or the uplink guard.
+        if msg.get_type() != "GPS_RAW_INT":
             return
-        if not ok:
+        if not (msg.fix_type >= 3 and (msg.lat != 0 or msg.lon != 0)):
             return
         if abs(msg.lat) > 900000000 or abs(msg.lon) > 1800000000:
             return
         lat, lon = msg.lat / 1e7, msg.lon / 1e7
         self.real_pos = (lat, lon)
-        if name == "GPS_RAW_INT" and self.anchor is None:
+        if self.anchor is None:
             self.anchor = Anchor(lat, lon, *self.fake_anchor)
             self.store.save(self.anchor)
 
@@ -400,6 +406,10 @@ def parse_ip_list(s):
 STATUS_INTERVAL = 1.0
 
 
+def status_datagram(on, fake):
+    return f"LIMA {int(on)} {fake[0]:.5f} {fake[1]:.5f}".encode("ascii")
+
+
 def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic, status=None):
     from_router = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     from_gcs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -453,7 +463,7 @@ def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic, status=
                 state = peer is not None
                 now = clock()
                 if state != status_state or now - status_sent >= STATUS_INTERVAL:
-                    _send(status_sock, b"LIMA 1" if state else b"LIMA 0", status)
+                    _send(status_sock, status_datagram(state, rewriter.fake_anchor), status)
                     status_state, status_sent = state, now
     finally:
         from_router.close()

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
+import itertools
 import json
 import logging
 import math
@@ -187,13 +188,13 @@ def _approx_acc_m(env):
     return km * 1000
 
 
-def _status_addr(env):
-    raw = env.get("AGPS_STATUS", "127.0.0.1:14572")
+def _host_port(env, name, default):
+    raw = env.get(name, default)
     if raw == "":
         return None
     host, sep, port = raw.rpartition(":")
     if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
-        raise ValueError("invalid AGPS_STATUS: expected host:port")
+        raise ValueError(f"invalid {name}: expected host:port")
     return host, int(port)
 
 
@@ -208,6 +209,8 @@ class Settings(NamedTuple):
     manual: object
     manual_acc_m: float
     status: object
+    map_icon: bool
+    map_tcp: tuple
 
     @classmethod
     def from_env(cls, env):
@@ -221,7 +224,9 @@ class Settings(NamedTuple):
             cache_acc_m=_number(env, "AGPS_CACHE_ACC_KM", "25", 1000),
             manual=parse_manual(env),
             manual_acc_m=_approx_acc_m(env),
-            status=_status_addr(env),
+            status=_host_port(env, "AGPS_STATUS", "127.0.0.1:14572"),
+            map_icon=env.get("AGPS_MAP_ICON", "1") != "0",
+            map_tcp=_host_port(env, "AGPS_MAP_TCP", "127.0.0.1:5760") or ("127.0.0.1", 5760),
         )
 
 
@@ -231,6 +236,7 @@ RESEND_AFTER_S = 30
 CACHE_INTERVAL_S = 900
 FRAME_GAP_S = 0.1
 STATUS_INTERVAL_S = 1
+ICON_HB_MAX_S = 3
 
 
 def status_datagram(pos):
@@ -249,9 +255,115 @@ def udp_status_sender(dest):
     return send
 
 
+# The router stops forwarding 1/1 to a connection that has sent 1/1, so the spoof must never
+# share the 1/193 telemetry connection. Whatever the router sends here is read and discarded.
+class TcpFrameSender(threading.Thread):
+    def __init__(self, host, port, retry_s=10):
+        super().__init__(daemon=True)
+        self.host, self.port, self.retry_s = host, port, retry_s
+        self.sock = None
+        self.lock = threading.Lock()
+
+    @property
+    def connected(self):
+        return self.sock is not None
+
+    def run(self):
+        while True:
+            sock = None
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=3)
+                sock.settimeout(2)
+                with self.lock:
+                    self.sock = sock
+                while self._drain(sock):
+                    pass
+            except OSError:
+                pass
+            self._drop(sock)
+            time.sleep(self.retry_s)
+
+    @staticmethod
+    def _drain(sock):
+        try:
+            return bool(sock.recv(4096))
+        except socket.timeout:
+            return True
+
+    def _drop(self, sock):
+        if sock is None:
+            return
+        with self.lock:
+            if self.sock is sock:
+                self.sock = None
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+    def send(self, frame):
+        with self.lock:
+            sock = self.sock
+            if sock is None:
+                return
+            try:
+                sock.sendall(frame)
+                return
+            except OSError:
+                pass
+        self._drop(sock)
+
+
+STATUSTEXT_ICON = b"AGPS: map icon approximate until GPS fix"
+ICON_EVENT_GAP_S = 0.1
+ICON_FLOOR_S = 1
+
+
+class ApproxIcon:
+    def __init__(self, send, clock=time.monotonic):
+        self.send = send
+        self.clock = clock
+        self.mav = mavlink.MAVLink(None, srcSystem=FC[0], srcComponent=FC[1])
+        self.fc_alt = None
+        self.fc_rel_alt = 0
+        self.fc_boot_ms = 0
+        self.last_latlon = None
+        self.last_send = None
+
+    def fc_position(self, m):
+        if self.last_latlon == (m.lat, m.lon):
+            return
+        self.fc_alt, self.fc_rel_alt, self.fc_boot_ms = m.alt, m.relative_alt, m.time_boot_ms
+
+    def frame(self, pos):
+        lat, lon = round(pos.lat * 1e7), round(pos.lon * 1e7)
+        alt = self.fc_alt if self.fc_alt is not None else round(pos.alt_m * 1000)
+        self.last_latlon = (lat, lon)
+        msg = mavlink.MAVLink_global_position_int_message(
+            self.fc_boot_ms, lat, lon, alt, self.fc_rel_alt, 0, 0, 0, 65535)
+        data = msg.pack(self.mav)
+        self.mav.seq = (self.mav.seq + 1) & 0xFF
+        return data
+
+    def update(self, pos, active, event):
+        if not active or pos is None:
+            self.last_send = None
+            return
+        now = self.clock()
+        since = None if self.last_send is None else now - self.last_send
+        if since is not None and not (since >= ICON_FLOOR_S or (event and since >= ICON_EVENT_GAP_S)):
+            return
+        self.last_send = now
+        try:
+            self.send(self.frame(pos))
+        except OSError:
+            pass
+
+
 class Runner:
     def __init__(self, conn, settings, cache, clock=time.monotonic, wall=time.time,
-                 ntp=ntp_synced, sleep=time.sleep, status_send=None):
+                 ntp=ntp_synced, sleep=time.sleep, status_send=None, icon=None):
         self.conn = conn
         self.settings = settings
         self.cache = cache
@@ -260,6 +372,7 @@ class Runner:
         self.ntp = ntp
         self.sleep = sleep
         self.status_send = status_send
+        self.icon = icon
         self.armed = False
         self.last_save = None
         if not settings.cache_enabled:
@@ -276,6 +389,10 @@ class Runner:
         self.fix_at_detect = False
         self.chosen_pos = None
         self.status_t = None
+        self.icon_announced = False
+
+    def link_lost(self):
+        self._restart()
 
     def handle(self, m):
         if m.get_srcSystem() != FC[0] or m.get_srcComponent() != FC[1]:
@@ -289,6 +406,23 @@ class Runner:
             self.armed = bool(m.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
         elif kind == "GPS_RAW_INT":
             self._on_gps(m)
+            self._icon_step(event=True)
+        elif kind == "GLOBAL_POSITION_INT" and self.icon is not None:
+            self.icon.fc_position(m)
+            self._icon_step(event=True)
+
+    def icon_active(self, now):
+        return (self.state == "SENT" and self.chosen_pos is not None and not self.good_fix
+                and self.last_hb is not None and now - self.last_hb <= ICON_HB_MAX_S)
+
+    def _icon_step(self, event):
+        if self.icon is None:
+            return
+        active = self.icon_active(self.clock())
+        if active and not self.icon_announced:
+            self.icon_announced = True
+            self.conn.mav.statustext_send(mavlink.MAV_SEVERITY_NOTICE, STATUSTEXT_ICON)
+        self.icon.update(self.chosen_pos, active, event)
 
     def _on_gps(self, m):
         now = self.clock()
@@ -326,6 +460,7 @@ class Runner:
                 self.status_t is None or now - self.status_t >= STATUS_INTERVAL_S):
             self.status_send(status_datagram(self.chosen_pos))
             self.status_t = now
+        self._icon_step(event=False)
 
     def send_bundle(self, have_fix):
         wall = self.wall()
@@ -364,12 +499,43 @@ def _wait_for(conn, kind, timeout_s):
     return None
 
 
-def serve(conn, runner, stop):
+RECONNECT_BACKOFF_S = (1, 2, 5, 10)
+
+
+def _reconnect(reconnect, runner, stop, wait, why):
+    logging.warning("agps: FC link lost (%s), reconnecting", why)
+    runner.link_lost()
+    for attempt in itertools.count():
+        wait(RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)])
+        if stop.is_set():
+            return None
+        try:
+            return reconnect()
+        except Exception as e:
+            logging.warning("agps: reconnect failed (%s)", type(e).__name__)
+
+
+def serve(conn, runner, stop, reconnect=None, wait=None):
+    # pymavlink's autoreconnect covers send, not recv: a router restart resets the socket
+    # and recv_match raises.
+    wait = wait or stop.wait
     while not stop.is_set():
-        m = conn.recv_match(blocking=True, timeout=0.5)
-        if m is not None and m.get_type() != "BAD_DATA":
-            runner.handle(m)
-        runner.tick()
+        try:
+            m = conn.recv_match(blocking=True, timeout=0.5)
+            if m is not None and m.get_type() != "BAD_DATA":
+                runner.handle(m)
+            runner.tick()
+        except OSError as e:
+            if reconnect is None:
+                raise
+            try:
+                conn.close()
+            except Exception:
+                pass
+            new = _reconnect(reconnect, runner, stop, wait, type(e).__name__)
+            if new is None:
+                return
+            conn = runner.conn = new
 
 
 def main(argv=None, env=os.environ, connect=None):
@@ -400,11 +566,17 @@ def main(argv=None, env=os.environ, connect=None):
 
     if cmd == "run":
         send = udp_status_sender(settings.status) if settings.status else None
-        runner = Runner(conn, settings, cache, status_send=send)
+        icon = None
+        if settings.map_icon:
+            sender = TcpFrameSender(*settings.map_tcp)
+            sender.start()
+            icon = ApproxIcon(sender.send)
+        runner = Runner(conn, settings, cache, status_send=send, icon=icon)
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
-        serve(conn, runner, stop)
+        serve(conn, runner, stop, reconnect=lambda: connect(
+            settings.mavlink, source_system=1, source_component=193, autoreconnect=True))
         return 0
 
     hb = _wait_for(conn, "HEARTBEAT", WAIT_HEARTBEAT_S)

@@ -32,9 +32,13 @@ def gps(fix, lat=470000000, lon=80000000, src=(1, 1)):
 class FakeMav:
     def __init__(self):
         self.calls = []
+        self.statuses = []
 
     def gps_inject_data_send(self, ts, tc, n, data):
         self.calls.append((ts, tc, n, bytes(data[:n])))
+
+    def statustext_send(self, severity, text):
+        self.statuses.append((severity, text))
 
 
 class FakeConn:
@@ -50,7 +54,7 @@ class RunnerBase(unittest.TestCase):
         self.t = 0.0
         self.ntp_ok = True
 
-    def make(self, env=None, status=True):
+    def make(self, env=None, status=True, icon=False):
         e = dict(MANUAL_ENV)
         e["AGPS_CACHE_FILE"] = self.cache_path
         e.update(env or {})
@@ -67,8 +71,10 @@ class RunnerBase(unittest.TestCase):
         cache.save = save
         self.status = []
         send = (lambda data: self.status.append((self.t, data))) if status else None
+        self.icon_frames = []
+        ic = agps.ApproxIcon(lambda f: self.icon_frames.append((self.t, f)), clock=lambda: self.t) if icon else None
         return agps.Runner(self.conn, s, cache, clock=lambda: self.t, wall=lambda: 1_800_000_000.0 + self.t,
-                           ntp=lambda: self.ntp_ok, sleep=lambda s: None, status_send=send)
+                           ntp=lambda: self.ntp_ok, sleep=lambda s: None, status_send=send, icon=ic)
 
     @property
     def calls(self):
@@ -274,6 +280,149 @@ class StatusTest(RunnerBase):
         text = "\n".join(cm.output)
         for bad in ("47.1", "8.65", "471234", "86543"):
             self.assertNotIn(bad, text)
+
+
+def gpi(lat=0, lon=0, src=(1, 1), alt=0):
+    return msg(mavlink.MAVLink_global_position_int_message, src, time_boot_ms=0, lat=lat, lon=lon, alt=alt,
+               relative_alt=0, vx=0, vy=0, vz=0, hdg=0)
+
+
+def decoded(frames):
+    from lima_frames import decode
+    return [decode(f)[0] for _, f in frames]
+
+
+class IconTest(RunnerBase):
+    def sent(self, r):
+        self.at(0, r, gps(1))
+        self.at(15, r)
+        self.assertEqual(r.state, "SENT")
+
+    def test_icon_while_sent_only(self):
+        r = self.make(icon=True)
+        self.at(0, r, gps(1))
+        self.at(14, r)
+        self.assertEqual(self.icon_frames, [])
+        self.at(15, r)
+        m = decoded(self.icon_frames)[0]
+        self.assertEqual((m.lat, m.lon), (470000000, 80000000))
+        self.assertEqual(self.icon_frames[0][0], 15)
+
+    def test_event_send_on_fc_messages(self):
+        r = self.make(icon=True)
+        self.sent(r)
+        self.at(20, r)
+        n = len(self.icon_frames)
+        self.at(20.5, r, gps(1))
+        self.assertEqual(self.icon_frames[-1][0], 20.5)
+        self.assertEqual(len(self.icon_frames), n + 1)
+        self.at(20.55, r, gpi())
+        self.assertEqual(len(self.icon_frames), n + 1)
+        self.at(20.7, r, gpi())
+        self.assertEqual(self.icon_frames[-1][0], 20.7)
+
+    def test_stops_on_first_fix(self):
+        r = self.make(icon=True)
+        self.sent(r)
+        self.at(40, r, gps(3))
+        self.assertEqual(r.state, "DONE")
+        self.assertTrue(all(t < 40 for t, _ in self.icon_frames))
+        self.at(60, r, gps(3), gpi())
+        self.assertTrue(all(t < 40 for t, _ in self.icon_frames))
+
+    def test_stops_on_heartbeat_loss_then_resumes_after_reboot(self):
+        r = self.make(icon=True)
+        self.sent(r)
+        self.at(20, r)
+        last = self.icon_frames[-1][0]
+        self.at(22.9, r, gps(1), hb=False)
+        self.assertEqual(self.icon_frames[-1][0], 22.9)
+        before = len(self.icon_frames)
+        self.at(23.1, r, gps(1), hb=False)
+        self.at(25, r, hb=False)
+        self.at(29, r, hb=False)
+        self.assertEqual(len(self.icon_frames), before)
+        self.at(40, r, hb=False)
+        self.assertEqual(r.state, "WAIT_GPS")
+        self.at(41, r, gps(1))
+        self.at(56, r)
+        self.assertEqual(r.state, "SENT")
+        self.assertGreater(self.icon_frames[-1][0], 55.9)
+
+    def test_no_icon_without_position(self):
+        r = self.make(env={"AGPS_CACHE": "0"}, icon=True)
+        r.settings = r.settings._replace(manual=None)
+        self.sent(r)
+        self.at(20, r, gps(1))
+        self.assertEqual(self.icon_frames, [])
+        self.assertEqual(self.conn.mav.statuses, [])
+
+    def test_no_icon_when_fix_already_present(self):
+        r = self.make(icon=True)
+        self.at(0, r, gps(3))
+        self.at(15, r)
+        self.at(20, r, gps(3))
+        self.assertEqual(self.icon_frames, [])
+
+    def test_runner_without_icon(self):
+        r = self.make(icon=False)
+        self.sent(r)
+        self.at(20, r, gps(1), gpi())
+        self.at(40, r, gps(3))
+        self.assertEqual(self.conn.mav.statuses, [])
+
+    def test_foreign_gpi_ignored(self):
+        r = self.make(icon=True)
+        self.sent(r)
+        self.at(20, r, gpi(src=(1, 193), alt=777), gpi(src=(255, 190), alt=777), gps(1))
+        self.assertNotEqual(decoded(self.icon_frames)[-1].alt, 777)
+        self.at(22, r, gpi(alt=555))
+        self.at(23, r, gps(1))
+        self.assertEqual(decoded(self.icon_frames)[-1].alt, 555)
+
+    def test_statustext_once_per_sent(self):
+        r = self.make(icon=True)
+        self.sent(r)
+        self.at(20, r, gps(1))
+        self.at(30, r, gps(1))
+        self.assertEqual(self.conn.mav.statuses,
+                         [(mavlink.MAV_SEVERITY_NOTICE, agps.STATUSTEXT_ICON)])
+        self.at(50, r, hb=False)
+        self.at(51, r, gps(1))
+        self.at(66, r)
+        self.assertEqual(r.state, "SENT")
+        self.assertEqual(len(self.conn.mav.statuses), 2)
+
+    def test_link_lost_restarts(self):
+        r = self.make(icon=True)
+        self.sent(r)
+        r.link_lost()
+        self.assertEqual(r.state, "WAIT_GPS")
+        n = len(self.icon_frames)
+        self.at(16, r, gps(1))
+        self.assertEqual(len(self.icon_frames), n)
+
+    def test_no_coordinates_logged(self):
+        r = self.make({"AGPS_APPROX_LAT": "47.123456", "AGPS_APPROX_LON": "8.654321"}, icon=True)
+        with self.assertLogs(level=logging.INFO) as cm:
+            self.sent(r)
+            self.at(20, r, gps(1))
+            self.at(40, r, gps(3))
+        self.assertTrue(self.icon_frames)
+        text = "\n".join(cm.output)
+        for bad in ("47.1", "8.65", "471234", "86543"):
+            self.assertNotIn(bad, text)
+        for _, text in self.conn.mav.statuses:
+            self.assertNotRegex(text.decode(), r"\d\d\.")
+
+    def test_nothing_but_gpi_and_statustext_reaches_fc(self):
+        r = self.make(icon=True)
+        self.sent(r)
+        self.at(20, r, gps(1), gpi())
+        for _, f in self.icon_frames:
+            self.assertEqual(decoded([(0, f)])[0].get_type(), "GLOBAL_POSITION_INT")
+        for ts, tc, n, data in self.conn.mav.calls:
+            self.assertEqual(data[:2], b"\xb5\x62")
 
 
 def r_cache_lat(path):

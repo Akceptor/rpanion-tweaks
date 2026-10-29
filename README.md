@@ -26,7 +26,7 @@ PI 7.6V 1.2A 68%
 | `fps` | frames reaching the encoder | Per viewer |
 | `FC ...` (bottom left) | MAVLink `SYS_STATUS` / `BATTERY_STATUS` over UDP | Flight controller battery. Hidden if no data for 5 s. See [Battery overlay](#battery-overlay) |
 | `PI ...` (bottom left) | INA226 on I2C | Companion battery, measured before the BEC. Hidden if the sensor is absent. See [Battery overlay](#battery-overlay) |
-| `GPS 3D 12 sats`, `HDOP Good (1.2)`, lat/lon (bottom right) | MAVLink `GPS_RAW_INT` over UDP | FC GPS fix, satellites, HDOP with rating (Excellent <= 1, Good <= 2, Usable <= 5, else Poor); coordinates shown from 2D fix up. Hidden if no data for 5 s. Coordinates follow Lima state: shifted like the GCS map while `Lima: ON`, hidden if Lima has no anchor yet. Without a fix, an `≈ lat lon (cache ±N km)` line shows the approximate position from the agps service (UDP `127.0.0.1:14572`, `AGPS <cache\|manual> <acc_m> <lat> <lon>`) |
+| `GPS 3D 12 sats`, `HDOP Good (1.2)`, lat/lon (bottom right) | MAVLink `GPS_RAW_INT` over UDP | FC GPS fix, satellites, HDOP with rating (Excellent <= 1, Good <= 2, Usable <= 5, else Poor); coordinates shown from 2D fix up. Hidden if no data for 5 s. Coordinates follow Lima state: shifted like the GCS map while `Lima: ON`, hidden if Lima has no anchor yet. Without a fix, an `≈ lat lon` line shows the same point as the GCS map (real approximate position with Lima OFF; Lima's fake point, or the shifted point with an anchor, with Lima ON; no line if Lima is ON and its fake point is unknown). Source: the agps service (UDP `127.0.0.1:14572`, `AGPS <cache\|manual> <acc_m> <lat> <lon>`) and Lima's status (`LIMA <0\|1> <fake_lat> <fake_lon>`) |
 | `Lima: ON/OFF` (bottom centre) | Lima status UDP `127.0.0.1:14571` | ON while a GCS is connected to Lima, OFF otherwise (including Lima not installed or stopped). See [Lima](#lima-fake-position-on-the-gcs-map) |
 
 Fields that aren't available on your hardware are hidden. Slow commands (`vcgencmd`, `mmcli`) run every 5 s in a background thread so they never stall the video.
@@ -165,7 +165,8 @@ FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (re
 ```
 
 - The rover's first good GPS fix (3D or better) after Lima starts maps to the Lima point. No reference point to set.
-- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one.
+- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one. The one exception is `GLOBAL_POSITION_INT`: its coordinates are replaced with the Lima point, so the icon (for example agps's approximate-position icon, see AGPS "Map icon") sits on the Lima point before the first fix. `GPS_RAW_INT` and `GPS2_RAW` also pass before the first fix, with lat/lon zeroed, so the GCS shows "No Fix" rather than "No GPS". The real coordinate never leaves Lima.
+- The anchor and the uplink guard's reference position come only from `GPS_RAW_INT` fixes (3D or better), never from `GLOBAL_POSITION_INT`. The guard reference updates at the `GPS_RAW_INT` rate and keeps the last fix during a GPS outage.
 - The shift is in metres, so distances and headings on the map match reality. Altitude is unchanged.
 - Fails closed: a crash, a missing setting, or a message with a position Lima can't convert means the GCS gets nothing, never the real value.
 - After converting a GCS target back, anything more than `LIMA_MAX_TARGET_KM` from the rover is dropped and the GCS gets a `STATUSTEXT` warning.
@@ -257,7 +258,7 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 |---|---|---|
 | `LIMA_SERVE` | `0.0.0.0:14551` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
 | `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
-| `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second ON/OFF status for the video HUD (`STATS_LIMA_PORT`) |
+| `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second status for the video HUD (`STATS_LIMA_PORT`): `LIMA <0\|1> <fake_lat> <fake_lon>`, 5 decimals. Deploy Lima and the video-server together: an old HUD rejects this format and shows `Lima: OFF` |
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
 | `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
 | `LIMA_MAX_TARGET_KM` | `5` | Uplink guard: drop GCS targets farther than this from the rover |
@@ -284,9 +285,64 @@ Position source, first that applies: the last good fix the service cached on the
 - Short power-offs (under about 4 h). The receiver already has everything. It matters after longer power-offs and after the supercap has drained.
 - Proof of acceptance. The receiver's replies never reach the Pi, so the effect is measured (time to first fix), not confirmed.
 
+### Map icon
+
+Before the first 3D fix, once agps has sent the assist data and has a position, it also shows the vehicle icon on the GCS map at that approximate position. It sends a `GLOBAL_POSITION_INT` from 1/1 over its own second TCP connection to mavlink-router (`AGPS_MAP_TCP`), about 10 times a second at most and at least once a second, and stops at the first 3D fix, when the FC heartbeat is lost, or when the service stops. The message carries no motion, and `alt`/`relative_alt` are copied from the FC's own, so altitude readouts stay steady. One `AGPS: map icon approximate until GPS fix` notice goes out per boot. Nothing in logs or the notice contains coordinates.
+
+| Phase | GCS on UDP 14550 (Lima OFF) | GCS on Lima 14551 (Lima ON) | HUD |
+|---|---|---|---|
+| No fix, assist sent | icon at the real approximate position | icon at Lima's fake point (`to_fake` of it when Lima has an anchor) | `≈ lat lon`, the same point as the map |
+| First 3D fix | QGC keeps the approximate icon until the EKF has a position (seconds), then jumps to the real one | icon barely moves: the first fix maps to the fake point | fix line replaces `≈` |
+
+It never reaches the autopilot: mavlink-router does not forward a 1/1 message back toward the FC (loop rule, the same one Battery 2 relies on), and ArduPilot drops messages carrying its own sysid/compid. agps never sends `GPS_RAW_INT`, `GPS_INPUT`, a GPS origin or home position.
+
+Limits:
+- The icon is up to the accuracy radius (cache 25 km, manual up to 500 km) away from the rover and looks like a real position. Do not navigate by it. It never moves, and the HUD `≈` marks it.
+- Mission Planner may flash to 0,0 for a few ms when the FC's own zero position arrives first.
+- GCS link-quality stats read slightly worse (the 1/1 sequence numbers interleave with the FC's).
+- Rpanion's web UI, logger and the router's tlog also see the approximate position.
+- If agps stops during the approximate phase, QGC keeps the icon frozen.
+
+Rollback: set `AGPS_MAP_ICON=0` in `/etc/agps.env` and `sudo systemctl restart agps`. The HUD line and the status datagram stay.
+
+If mavlink-router restarts, agps logs `FC link lost`, restarts its state machine and reconnects with a 1 to 10 s backoff instead of exiting.
+
+### Check the map icon on hardware
+
+Deploy `python/agps.py`, `python/lima.py` and `python/video-server.py` together (see Install), restart `agps`, `lima` and the video service. Use a GPS with no fix (indoors or antenna covered) and a cache or manual position (`journalctl -u agps` shows `pos=cache|manual`).
+
+1. FC untouched: no new prearm or EKF messages, `HOME_POSITION` unchanged, `EKF_STATUS_REPORT` flags the same as with `AGPS_MAP_ICON=0`. In QGC's MAVLink Inspector (Lima OFF), `GLOBAL_POSITION_INT` from 1/1 alternates between the FC's `0,0` and ours.
+2. QGC on `14550` (Lima OFF): the icon appears about 15 s after GPS detection at the approximate point and stays put for 2 min with no jump to 0,0. Altitude steady. One `AGPS: map icon approximate until GPS fix` notice (note if QGC doesn't show it). HUD `≈` shows the same 2 decimals.
+3. QGC on Lima `14551` right after a Pi reboot: the icon sits on the Lima fake point and the HUD shows `≈ -12.07 -77.04`. No message in the MAVLink Inspector carries a real coordinate. `/run/lima/anchor.json` does not exist while the icon is spoofed.
+4. First fix, outdoors: the HUD switches to the fix line. With Lima ON the icon stays near the fake point and starts tracking, and the anchor file appears; its `real_lat/real_lon` is within about 50 m of the real fix. Note how long QGC on `14550` keeps the approximate icon after the fix.
+5. Lima ON with an anchor: with the Pi up, power-cycle only the FC indoors. After agps's resend the icon shows `to_fake(approx)` and the HUD the same 2 decimals. A "Go to location" click near that icon is refused by Lima, never sent.
+6. Mission Planner on `14550`: icon at the approximate point. Note how often it flashes to 0,0.
+7. Rollback: `AGPS_MAP_ICON=0` + `sudo systemctl restart agps`, power-cycle the FC: no icon before the fix, the HUD `≈` line stays.
+8. Router restart: `sudo systemctl restart rpanion-server`. `journalctl -u agps` shows one `FC link lost` line, no traceback and no service restart, and the icon returns after the next `SENT`.
+
 ### Privacy
 
 The cache stores your area (rounded to ~1 km) in `/var/lib/agps/last_fix.json` on the SD card, mode 0600. `AGPS_CACHE=0` turns it off and deletes the file. Injected data goes only to the FC. Logs never contain coordinates.
+
+### Optional accounts and tokens
+
+The service needs no account. These tokens are only kept for future features (online AssistNow, cell-tower position) and are ignored today:
+
+| Service | What for | Where to get it |
+|---|---|---|
+| u-blox Thingstream AssistNow (ZTP) | Online orbit data for a fast first-ever fix ("option C", not implemented). The legacy AssistNow Online/Offline tokens are no longer issued. | Sign up at <https://portal.thingstream.io/> → **Services → ZTP → Device Profiles → Create Profile** (chip type `OTHER` for the MAX-M10S, profile type **Evaluation**: 300 requests/month). Copy the **ZTP token** from the profile's Details tab. Endpoint: `https://api.thingstream.io/ztp/assistnow/credentials`. Guides: [getting started](https://support.thingstream.io/hc/en-gb/articles/20837860069788-AssistNow-Getting-Started-Guide), [device registration](https://support.thingstream.io/hc/en-gb/articles/19691380675356-AssistNow-device-registration) |
+| OpenCellID | Offline cell-ID → position lookup (coverage is sparse: check your cell first) | Sign up at <https://opencellid.org/> → API access token (`pk.…`); per-country exports at <https://opencellid.org/downloads.php> |
+
+Save them on the Pi, root-only, without putting them in shell history (run on the Pi; prompts for each value):
+
+```bash
+sudo touch /etc/agps.env && sudo chmod 600 /etc/agps.env
+read -rsp 'Thingstream ZTP token: ' T && echo && printf 'AGPS_ZTP_TOKEN=%s\n' "$T" | sudo tee -a /etc/agps.env >/dev/null; unset T
+read -rsp 'OpenCellID token: ' T && echo && printf 'AGPS_OCID_TOKEN=%s\n' "$T" | sudo tee -a /etc/agps.env >/dev/null; unset T
+sudo grep -c TOKEN /etc/agps.env   # counts lines, doesn't print them
+```
+
+Never commit these values; the repo is public.
 
 ### Install (on the Pi)
 
@@ -332,6 +388,8 @@ Set in `/etc/agps.env` (no spaces around `=`). An invalid number makes the servi
 | `AGPS_APPROX_ALT_M` | `0` | ellipsoid altitude for the manual position |
 | `AGPS_APPROX_ACC_KM` | `50` | accuracy radius of the manual position, 1..500. Use the radius that covers every place the rover may start from, measured from the point you typed |
 | `AGPS_STATUS` | `127.0.0.1:14572` | `host:port` that gets a 1 Hz UDP line `AGPS <cache\|manual> <acc_m> <lat> <lon>` while waiting for the first 3D fix, so the video HUD can show the approximate position used. Empty disables. Invalid exits with status 2. Never logged |
+| `AGPS_MAP_ICON` | `1` | `0` turns the approximate map icon off (HUD line and status datagram are unaffected) |
+| `AGPS_MAP_TCP` | `127.0.0.1:5760` | mavlink-router TCP server for the separate write-only connection that carries the icon. Invalid exits with status 2 |
 | `AGPS_CACHE` | `1` | `0` disables the cache and deletes the file |
 | `AGPS_CACHE_FILE` | `/var/lib/agps/last_fix.json` | |
 | `AGPS_CACHE_MAX_DAYS` | `14` | older cache entries are ignored |

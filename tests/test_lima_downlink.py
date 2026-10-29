@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import struct
 import tempfile
 import unittest
 
@@ -64,13 +65,105 @@ class DownlinkTest(unittest.TestCase):
 
     def test_no_anchor_drops_positions(self):
         rw = self.rewriter()
-        self.assertEqual(rw.downlink(frame(gpi(*REAL))), [])
+        home = mavlink.MAVLink_home_position_message(
+            round(REAL[0] * 1e7), round(REAL[1] * 1e7), 100, 0, 0, 0, [1, 0, 0, 0], 0, 0, 0)
+        self.assertEqual(rw.downlink(frame(home)), [])
         hb = frame(heartbeat())
         self.assertEqual(rw.downlink(hb), [hb])
 
+    def test_no_anchor_gps_raw_without_fix_passes_with_zero_coords(self):
+        rw = self.rewriter()
+        data = frame(gps(*REAL, 1))
+        out = rw.downlink(data)
+        self.assertEqual(len(out), 1)
+        m = decode(out[0])[0]
+        self.assertEqual((m.fix_type, m.satellites_visible, m.eph, m.epv), (1, 10, 100, 100))
+        self.assertEqual((m.lat, m.lon, m.alt), (0, 0, 500000))
+        self.assertNotIn(struct.pack("<i", round(REAL[0] * 1e7)), out[0])
+        self.assertNotIn(struct.pack("<i", round(REAL[1] * 1e7)), out[0])
+        self.assertIsNone(rw.anchor)
+
+    def test_no_anchor_gps2_raw_passes_with_zero_coords(self):
+        rw = self.rewriter()
+        msg = mavlink.MAVLink_gps2_raw_message(
+            0, 2, round(REAL[0] * 1e7), round(REAL[1] * 1e7), 500000, 100, 100, 0, 0, 9, 0, 0)
+        out = rw.downlink(frame(msg))
+        self.assertEqual(len(out), 1)
+        m = decode(out[0])[0]
+        self.assertEqual((m.fix_type, m.satellites_visible, m.eph), (2, 9, 100))
+        self.assertEqual((m.lat, m.lon), (0, 0))
+        self.assertNotIn(struct.pack("<i", round(REAL[0] * 1e7)), out[0])
+        self.assertNotIn(struct.pack("<i", round(REAL[1] * 1e7)), out[0])
+
+    def test_no_anchor_gps_raw_fix3_anchors_then_converts(self):
+        rw = self.rewriter()
+        out = rw.downlink(frame(gps(*REAL, 3)))
+        self.assertIsNotNone(rw.anchor)
+        m = decode(out[0])[0]
+        self.assertLess(lima.distance_m(m.lat / 1e7, m.lon / 1e7, *FAKE), 1)
+
+    def test_no_anchor_gpi_shows_fake_point(self):
+        rw = self.rewriter()
+        out = rw.downlink(frame(gpi(*REAL), sysid=1, compid=1, seq=7))
+        self.assertEqual(len(out), 1)
+        m = decode(out[0])[0]
+        self.assertEqual((m.lat, m.lon), (round(FAKE[0] * 1e7), round(FAKE[1] * 1e7)))
+        self.assertEqual((m.alt, m.relative_alt, m.vx, m.vy, m.vz, m.hdg), (500000, 1500, 10, -20, 3, 9000))
+        self.assertEqual((m.get_srcSystem(), m.get_srcComponent(), m.get_seq()), (1, 1, 7))
+        self.assertNotIn(struct.pack("<i", round(REAL[0] * 1e7)), out[0])
+        self.assertNotIn(struct.pack("<i", round(REAL[1] * 1e7)), out[0])
+
+    def test_no_anchor_gpi_v1_stays_v1(self):
+        rw = self.rewriter()
+        out = rw.downlink(frame(gpi(*REAL), v1=True))
+        self.assertEqual(out[0][0], 0xFE)
+        m = decode(out[0])[0]
+        self.assertEqual((m.lat, m.lon), (round(FAKE[0] * 1e7), round(FAKE[1] * 1e7)))
+        self.assertNotIn(struct.pack("<i", round(REAL[0] * 1e7)), out[0])
+
+    def test_no_anchor_half_unset_gpi_leaks_nothing(self):
+        rw = self.rewriter()
+        for lat, lon in ((round(REAL[0] * 1e7), 0), (0, round(REAL[1] * 1e7)),
+                         (lima.INT32_MAX, round(REAL[1] * 1e7))):
+            out = rw.downlink(frame(bad_gpi(lat, lon)))
+            m = decode(b"".join(out))[0]
+            self.assertEqual((m.lat, m.lon), (round(FAKE[0] * 1e7), round(FAKE[1] * 1e7)))
+
+    def test_no_anchor_zero_gpi_untouched(self):
+        rw = self.rewriter()
+        data = frame(gpi(0, 0))
+        self.assertEqual(rw.downlink(data), [data])
+
+    def test_gpi_never_anchors(self):
+        rw = self.rewriter()
+        for _ in range(100):
+            rw.downlink(frame(gpi(50.0, 30.0)))
+        self.assertIsNone(rw.anchor)
+        self.assertIsNone(rw.real_pos)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_spoof_then_fix_anchors_on_fix(self):
+        rw = self.rewriter()
+        for _ in range(3):
+            rw.downlink(frame(gpi(50.0, 30.0)))
+        rw.downlink(frame(gps(*REAL, 3)))
+        self.assertEqual((rw.anchor.real_lat, rw.anchor.real_lon), REAL)
+        saved = self.store.load()
+        self.assertEqual((saved.real_lat, saved.real_lon), REAL)
+
+    def test_late_spoof_after_fix_does_not_move_anchor_or_guard(self):
+        rw = self.rewriter()
+        rw.downlink(frame(gps(*REAL, 3)))
+        out = decode(b"".join(rw.downlink(frame(gpi(50.0, 30.0)))))[0]
+        self.assertEqual((rw.anchor.real_lat, rw.anchor.real_lon), REAL)
+        self.assertEqual(rw.real_pos, REAL)
+        want = rw.anchor.to_fake(50.0, 30.0)
+        self.assertAlmostEqual(out.lat / 1e7, want[0], places=6)
+        self.assertAlmostEqual(out.lon / 1e7, want[1], places=6)
+
     def test_anchor_from_first_3d_fix(self):
         rw = self.rewriter()
-        self.assertEqual(rw.downlink(frame(gps(*REAL, 2))), [])
+        rw.downlink(frame(gps(*REAL, 2)))
         self.assertIsNone(rw.anchor)
         self.assertIsNone(self.store.load())
         out = decode(b"".join(rw.downlink(frame(gps(*REAL, 3)))))
@@ -216,11 +309,15 @@ class DownlinkTest(unittest.TestCase):
         self.assertEqual(msgs[0].get_type(), "HEARTBEAT")
         self.assertAlmostEqual(msgs[1].lat, round(FAKE[0] * 1e7), delta=1)
 
-    def test_tracks_real_pos(self):
+    def test_real_pos_from_gps_only(self):
         rw = self.anchored()
         rw.downlink(frame(gpi(47.001, 8.002)))
+        self.assertEqual(rw.real_pos, REAL)
+        rw.downlink(frame(gps(47.001, 8.002, 3)))
         self.assertAlmostEqual(rw.real_pos[0], 47.001, places=6)
         self.assertAlmostEqual(rw.real_pos[1], 8.002, places=6)
+        rw.downlink(frame(gps(47.5, 8.5, 2)))
+        self.assertAlmostEqual(rw.real_pos[0], 47.001, places=6)
 
     def test_track_ignores_invalid_latlon(self):
         rw = self.rewriter()
@@ -229,8 +326,8 @@ class DownlinkTest(unittest.TestCase):
         rw.downlink(frame(bad_gps(0, -1810000000)))
         self.assertIsNone(rw.anchor)
         rw.downlink(frame(gps(*REAL, 3)))
-        rw.downlink(frame(bad_gpi(lima.INT32_MAX, lima.INT32_MAX)))
-        rw.downlink(frame(bad_gpi(0, 1810000000)))
+        rw.downlink(frame(bad_gps(lima.INT32_MAX, lima.INT32_MAX)))
+        rw.downlink(frame(bad_gps(0, 1810000000)))
         self.assertEqual(rw.real_pos, REAL)
 
     def test_unlisted_message_dropped(self):
