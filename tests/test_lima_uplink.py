@@ -64,6 +64,19 @@ class UplinkTest(unittest.TestCase):
     def fake_point(self, north, east):
         return offset(*FAKE, north, east)
 
+    def test_stored_anchor_spoof_converted_guard_unmoved(self):
+        self.store.save(lima.Anchor(*REAL, *FAKE))
+        rw = lima.Rewriter(self.store, FAKE, 5000.0, clock=lambda: self.now)
+        rw.downlink(frame(gps(*REAL)))
+        spoof = decode(b"".join(rw.downlink(frame(gpi(47.2, 8.0)))))[0]
+        self.assertEqual(rw.real_pos, REAL)
+        want = rw.anchor.to_fake(47.2, 8.0)
+        self.assertAlmostEqual(spoof.lat / 1e7, want[0], places=6)
+        self.assertEqual(rw.uplink(frame(item_int(*want))), [])
+        self.assertTrue(any("km" in w.decode(errors="ignore") for w in rw.take_warnings()))
+        near = rw.anchor.to_fake(*offset(*REAL, 100, 0))
+        self.assertEqual(len(rw.uplink(frame(item_int(*near)))), 1)
+
     def test_mission_item_back_to_real(self):
         rw = self.anchored()
         out = decode(b"".join(rw.uplink(frame(item_int(*self.fake_point(14.142, 14.142))))))

@@ -165,7 +165,8 @@ FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (re
 ```
 
 - The rover's first good GPS fix (3D or better) after Lima starts maps to the Lima point. No reference point to set.
-- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one.
+- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one. The one exception is `GLOBAL_POSITION_INT`: its coordinates are replaced with the Lima point, so the icon (for example agps's approximate-position icon, see AGPS "Map icon") sits on the Lima point before the first fix. The real coordinate never leaves Lima.
+- The anchor and the uplink guard's reference position come only from `GPS_RAW_INT` fixes (3D or better), never from `GLOBAL_POSITION_INT`. The guard reference updates at the `GPS_RAW_INT` rate and keeps the last fix during a GPS outage.
 - The shift is in metres, so distances and headings on the map match reality. Altitude is unchanged.
 - Fails closed: a crash, a missing setting, or a message with a position Lima can't convert means the GCS gets nothing, never the real value.
 - After converting a GCS target back, anything more than `LIMA_MAX_TARGET_KM` from the rover is dropped and the GCS gets a `STATUSTEXT` warning.
@@ -257,7 +258,7 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 |---|---|---|
 | `LIMA_SERVE` | `0.0.0.0:14551` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
 | `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
-| `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second ON/OFF status for the video HUD (`STATS_LIMA_PORT`) |
+| `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second status for the video HUD (`STATS_LIMA_PORT`): `LIMA <0\|1> <fake_lat> <fake_lon>`, 5 decimals. Deploy Lima and the video-server together: an old HUD rejects this format and shows `Lima: OFF` |
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
 | `LIMA_FAKE_ANCHOR` | `-12.0700,-77.0435` | Lima point the first fix maps to (Campo de Marte park, an open area) |
 | `LIMA_MAX_TARGET_KM` | `5` | Uplink guard: drop GCS targets farther than this from the rover |
