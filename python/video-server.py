@@ -104,6 +104,26 @@ def read_soc_temp():
         return None
 
 
+def read_uptime():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def format_uptime(seconds):
+    if seconds is None:
+        return ""
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return "UP {0}d {1:02d}:{2:02d}:{3:02d}".format(days, hours, minutes, secs)
+    return "UP {0}:{1:02d}:{2:02d}".format(hours, minutes, secs)
+
+
 def run_cmd(cmd: List[str]) -> str:
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
@@ -566,6 +586,7 @@ class SystemStats(threading.Thread):
         self.lines = ["", ""]
         self.batt_lines = ["", ""]
         self.gps_text = ""
+        self.uptime_text = ""
         self.mavlink = MavlinkBattery(env_number("STATS_MAVLINK_PORT", 14570))
         self.lima = LimaStatus(env_number("STATS_LIMA_PORT", 14571))
         self.ina = Ina226()
@@ -618,6 +639,7 @@ class SystemStats(threading.Thread):
             self.lines = [net, " | ".join(sys_parts)]
             self.batt_lines = [fc_line(self.mavlink.state, now), self.ina.line(now)]
             self.gps_text = gps_line(self.mavlink.state, now)
+            self.uptime_text = format_uptime(read_uptime())
             self.mavlink.send_batt2(self.ina.last, now)
 
 
@@ -630,6 +652,7 @@ def attach_stats(pipeline):
     battoverlay = pipeline.get_by_name("battoverlay")
     limaoverlay = pipeline.get_by_name("limaoverlay")
     gpsoverlay = pipeline.get_by_name("gpsoverlay")
+    uptimeoverlay = pipeline.get_by_name("uptimeoverlay")
 
     stats = SystemStats.get()
     frames = [0]
@@ -658,6 +681,8 @@ def attach_stats(pipeline):
             limaoverlay.set_property("text", lima_line(stats.lima.state, now))
         if gpsoverlay is not None:
             gpsoverlay.set_property("text", stats.gps_text)
+        if uptimeoverlay is not None:
+            uptimeoverlay.set_property("text", stats.uptime_text)
         return True
 
     return GLib.timeout_add(1000, tick)
@@ -759,6 +784,9 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
             pipeline.append("videoconvert")
             pipeline.append("clockoverlay time-format=\"%d-%b-%Y %H:%M:%S\" valignment=top halignment=left "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
+            # ypad must clear the clockoverlay's shaded box above
+            pipeline.append("textoverlay name=uptimeoverlay text=\"\" valignment=top halignment=left line-alignment=left "
+                            "font-desc=\"Sans 10\" shaded-background=true ypad=36")
             pipeline.append("textoverlay name=statsoverlay text=\"\" valignment=top halignment=right line-alignment=right "
                             "font-desc=\"Sans 10\" shaded-background=true ypad=10")
             pipeline.append("textoverlay name=battoverlay text=\"\" valignment=bottom halignment=left line-alignment=left "

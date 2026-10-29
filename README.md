@@ -22,6 +22,7 @@ PI 7.6V 1.2A 68%
 | `CPU %`, `°C` | `/proc/stat`, `thermal_zone0` | Any Pi |
 | `W` | `vcgencmd pmic_read_adc` | **Pi 5 only.** Board rails only — excludes USB devices such as the modem |
 | `UNDERVOLT` / `THROTTLED` | `vcgencmd get_throttled` | Only shown when there's a problem |
+| `UP 0:04:07` / `UP 2d 03:04:05` (top left, below the clock) | `/proc/uptime` | Time since the Pi booted |
 | `fps` | frames reaching the encoder | Per viewer |
 | `FC ...` (bottom left) | MAVLink `SYS_STATUS` / `BATTERY_STATUS` over UDP | Flight controller battery. Hidden if no data for 5 s. See [Battery overlay](#battery-overlay) |
 | `PI ...` (bottom left) | INA226 on I2C | Companion battery, measured before the BEC. Hidden if the sensor is absent. See [Battery overlay](#battery-overlay) |

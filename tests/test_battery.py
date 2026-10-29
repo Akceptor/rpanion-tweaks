@@ -549,5 +549,23 @@ class GpsTest(unittest.TestCase):
         self.assertEqual(vs.fc_line(st, 100.0), "")
 
 
+class UptimeTest(unittest.TestCase):
+    def test_format(self):
+        self.assertEqual(vs.format_uptime(0), "UP 0:00:00")
+        self.assertEqual(vs.format_uptime(247.9), "UP 0:04:07")
+        self.assertEqual(vs.format_uptime(13 * 3600), "UP 13:00:00")
+        self.assertEqual(vs.format_uptime(2 * 86400 + 3 * 3600 + 4 * 60 + 5), "UP 2d 03:04:05")
+        self.assertEqual(vs.format_uptime(86400), "UP 1d 00:00:00")
+        self.assertEqual(vs.format_uptime(None), "")
+
+    def test_read(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data="12345.67 4567.89\n")):
+            self.assertEqual(vs.read_uptime(), 12345.67)
+
+    def test_read_missing(self):
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIsNone(vs.read_uptime())
+
+
 if __name__ == "__main__":
     unittest.main()
