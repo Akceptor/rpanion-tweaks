@@ -13,6 +13,7 @@ import os
 import time
 import math
 import json
+import tempfile
 import threading
 import socket
 import struct
@@ -320,12 +321,13 @@ def clamp(value: int, lo: int, hi: int) -> int:
 
 
 # BATTERY_STATUS (147) as a MAVLink v2 frame, battery id 1 (a second battery next to the FC's id 0)
-def encode_battery_status(sysid: int, compid: int, seq: int, volts, amps, pct) -> bytes:
+def encode_battery_status(sysid: int, compid: int, seq: int, volts, amps, pct, mah=None) -> bytes:
     mv = 65535 if volts is None else clamp(round(volts * 1000), 0, 65534)
     ca = -1 if amps is None else clamp(round(amps * 100), -32768, 32767)
     rem = -1 if pct is None else clamp(round(pct), 0, 100)
+    used = -1 if mah is None else clamp(round(mah), 0, 2147483647)
     # ArduPilot puts the whole pack voltage in cell 0 when cells are unknown
-    payload = struct.pack("<iihH9HhBBBb", -1, -1, 32767, mv, *([65535] * 9), ca, 1, 0, 0, rem)
+    payload = struct.pack("<iihH9HhBBBb", used, -1, 32767, mv, *([65535] * 9), ca, 1, 0, 0, rem)
     hdr = bytes([len(payload), 0, 0, seq & 0xFF, sysid & 0xFF, compid & 0xFF]) + (147).to_bytes(3, "little")
     crc = crc_x25(hdr + payload + bytes([MAVLINK_MSGS[147][0]]))
     return b"\xFD" + hdr + payload + struct.pack("<H", crc)
@@ -605,12 +607,14 @@ def pack_percent(volts: float, cells: int):
     return lipo_percent(volts / cells)
 
 
-def format_pi_line(volts, amps, saturated, pct) -> str:
+def format_pi_line(volts, amps, saturated, pct, mah=None, clipped=False) -> str:
     if volts is None:
         return ""
     parts = ["{0:.1f}V".format(volts), "{0:.1f}A{1}".format(amps, "+" if saturated else "")]
     if pct is not None:
         parts.append("{0:.0f}%".format(pct))
+    if mah is not None:
+        parts.append("{0:.0f}mAh{1}".format(mah, "+" if clipped else ""))
     return "PI " + " ".join(parts)
 
 
@@ -624,6 +628,76 @@ def env_number(name: str, default):
         return default
 
 
+# Integrates current into consumed mAh. Samples further apart than MAX_GAP are not integrated
+# (the reference time is just reset). `clipped` means some integrated sample hit the shunt's
+# full scale, so mah is only a lower bound.
+class MahCounter:
+    MAX_GAP = 5.0
+
+    def __init__(self, mah: float = 0.0, clipped: bool = False):
+        self.mah = mah
+        self.clipped = clipped
+        self.prev = None
+
+    def add(self, amps: float, saturated: bool, now: float):
+        prev, self.prev = self.prev, now
+        if prev is None or not 0 <= now - prev <= self.MAX_GAP:
+            return
+        self.mah = max(0.0, self.mah + amps * (now - prev) / 3.6)
+        if saturated:
+            self.clipped = True
+
+
+def read_boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# The count must survive a video-server restart but not a battery swap, which is a Pi reboot.
+# /tmp is wiped on reboot here, and boot_id guards against a /tmp that is not.
+class MahStore:
+    SAVE_INTERVAL = 10.0
+
+    def __init__(self, path: str, boot_id=None):
+        self.path = path
+        self.boot_id = read_boot_id() if boot_id is None else boot_id
+        self.last_save = None
+
+    def load(self) -> MahCounter:
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            if data["boot_id"] == self.boot_id:
+                mah = float(data["mah"])
+                if mah >= 0:
+                    return MahCounter(mah, bool(data.get("clipped", False)))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return MahCounter()
+
+    def save(self, counter: MahCounter, now: float):
+        self.last_save = now
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path) or ".")
+            with os.fdopen(fd, "w") as f:
+                json.dump({"boot_id": self.boot_id, "mah": counter.mah, "clipped": counter.clipped}, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def maybe_save(self, counter: MahCounter, now: float):
+        if self.last_save is None or now - self.last_save >= self.SAVE_INTERVAL:
+            self.save(counter, now)
+
+
 # Minimal INA226 reader over /dev/i2c-N using only os/fcntl. Reopens on error, at most every 10 s.
 class Ina226:
     I2C_SLAVE = 0x0703
@@ -635,7 +709,9 @@ class Ina226:
         if self.shunt_ohms <= 0:
             self.shunt_ohms = 0.1
         self.cells = env_number("PI_BATT_CELLS", 2)
-        self.last = None  # (volts, amps, pct) from the latest line() call, None if unreadable
+        self.store = MahStore(os.environ.get("PI_MAH_FILE", "/tmp/pi_batt_mah.json"))
+        self.mah = self.store.load()
+        self.last = None  # (volts, amps, pct, mah) from the latest line() call, None if unreadable
         self.fd = None
         self.next_try = 0.0
 
@@ -666,8 +742,10 @@ class Ina226:
             shunt -= 0x10000
         volts, amps, saturated = ina226_convert(bus, shunt, self.shunt_ohms)
         pct = pack_percent(volts, self.cells)
-        self.last = (volts, amps, pct)
-        return format_pi_line(volts, amps, saturated, pct)
+        self.mah.add(amps, saturated, now)
+        self.store.maybe_save(self.mah, now)
+        self.last = (volts, amps, pct, self.mah.mah)
+        return format_pi_line(volts, amps, saturated, pct, self.mah.mah, self.mah.clipped)
 
     def close(self):
         if self.fd is not None:

@@ -3,6 +3,8 @@ import os
 import socket
 import struct
 import sys
+import tempfile
+import json
 import time
 import unittest
 from unittest import mock
@@ -306,6 +308,20 @@ class EncodeBatteryTest(unittest.TestCase):
         self.assertEqual((msgid, sysid, compid), (147, 42, 191))
         self.assertEqual(vs.decode_battery_status(payload), (1, None))
 
+    def test_current_consumed(self):
+        f = vs.encode_battery_status(7, 1, 9, 7.6, 1.21, 68, 123.6)
+        self.assertEqual(struct.unpack_from("<i", f, 10)[0], 124)
+
+    def test_current_consumed_unknown(self):
+        f = vs.encode_battery_status(7, 1, 9, 7.6, 1.21, 68)
+        self.assertEqual(struct.unpack_from("<i", f, 10)[0], -1)
+
+    def test_current_consumed_round_trip(self):
+        f = vs.encode_battery_status(42, 191, 200, 7.6, 1.21, 68, 5000.0)
+        msgid, sysid, compid, payload = decode_batt2(f)
+        self.assertEqual(msgid, 147)
+        self.assertEqual(struct.unpack_from("<i", payload, 0)[0], 5000)
+
     def test_unknown_pct(self):
         f = vs.encode_battery_status(1, 1, 0, 7.6, 1.0, None)
         self.assertEqual(struct.unpack_from("<b", f, 10 + 35)[0], -1)
@@ -344,7 +360,7 @@ class SysidTest(unittest.TestCase):
 
 
 class SendBatt2Test(unittest.TestCase):
-    READING = (7.6, 1.21, 68)
+    READING = (7.6, 1.21, 68, 123.0)
 
     def make(self, enabled=True, compid=1, sysid=3, fresh=True, sender=True, connected=True):
         m = vs.MavlinkBattery(0, enabled=enabled, compid=compid)
@@ -478,6 +494,13 @@ class Batt2SenderTest(unittest.TestCase):
 
 
 class Ina226ReadingTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"PI_MAH_FILE": os.path.join(self.tmp.name, "m.json")})
+        env.start()
+        self.addCleanup(env.stop)
+
     def make(self, regs):
         ina = vs.Ina226()
         ina.shunt_ohms, ina.cells, ina.fd = 0.01, 2, 99
@@ -486,8 +509,9 @@ class Ina226ReadingTest(unittest.TestCase):
 
     def test_last_matches_line(self):
         ina = self.make({1: 4840, 2: 6080})
-        self.assertEqual(ina.line(1.0), "PI 7.6V 1.2A 40%")
-        volts, amps, pct = ina.last
+        self.assertEqual(ina.line(1.0), "PI 7.6V 1.2A 40% 0mAh")
+        volts, amps, pct, mah = ina.last
+        self.assertEqual(mah, 0.0)
         self.assertAlmostEqual(volts, 7.6)
         self.assertAlmostEqual(amps, 1.21)
         self.assertEqual(pct, vs.pack_percent(volts, 2))
@@ -500,6 +524,158 @@ class Ina226ReadingTest(unittest.TestCase):
         ina.next_try = 1e9
         self.assertEqual(ina.line(2.0), "")
         self.assertIsNone(ina.last)
+
+
+    def test_mah_integrates_across_lines(self):
+        ina = self.make({1: 4840, 2: 6080})
+        ina.line(1.0)
+        self.assertEqual(ina.last[3], 0.0)
+        ina.line(5.0)
+        self.assertAlmostEqual(ina.last[3], 1.21 * 4 / 3.6)
+        self.assertTrue(ina.line(12.0).endswith("mAh"))
+
+    def test_no_integration_on_read_failure(self):
+        ina = self.make({1: 4840, 2: 6080})
+        ina.line(1.0)
+        ina.fd = None
+        ina.next_try = 1e9
+        ina.line(2.0)
+        self.assertIsNone(ina.last)
+        self.assertEqual(ina.mah.mah, 0.0)
+
+    def test_saturated_marks_clipped(self):
+        ina = self.make({1: 32767, 2: 6080})
+        ina.line(1.0)
+        line = ina.line(2.0)
+        self.assertTrue(line.endswith("mAh+"))
+
+
+class MahCounterTest(unittest.TestCase):
+    def test_first_sample_noop(self):
+        c = vs.MahCounter()
+        c.add(1.0, False, 100.0)
+        self.assertEqual(c.mah, 0.0)
+
+    def test_integration_math(self):
+        c = vs.MahCounter()
+        c.add(0.72, False, 100.0)
+        c.add(0.72, False, 105.0)
+        self.assertAlmostEqual(c.mah, 1.0)
+
+    def test_gap_skipped_and_reanchored(self):
+        c = vs.MahCounter()
+        c.add(1.0, False, 100.0)
+        c.add(1.0, False, 105.1)
+        self.assertEqual(c.mah, 0.0)
+        c.add(1.0, False, 106.1)
+        self.assertAlmostEqual(c.mah, 1 / 3.6)
+
+    def test_gap_exactly_5s_integrates(self):
+        c = vs.MahCounter()
+        c.add(3.6, False, 100.0)
+        c.add(3.6, False, 105.0)
+        self.assertAlmostEqual(c.mah, 5.0)
+
+    def test_negative_clamped_at_zero(self):
+        c = vs.MahCounter()
+        c.add(0.0, False, 0.0)
+        c.add(-3.6, False, 1.0)
+        self.assertEqual(c.mah, 0.0)
+        c.add(3.6, False, 2.0)
+        c.add(-3.6, False, 3.0)
+        self.assertAlmostEqual(c.mah, 0.0)
+
+    def test_negative_reduces(self):
+        c = vs.MahCounter(mah=10.0)
+        c.add(0.0, False, 0.0)
+        c.add(-3.6, False, 2.0)
+        self.assertAlmostEqual(c.mah, 8.0)
+
+    def test_clipped_flag(self):
+        c = vs.MahCounter()
+        c.add(0.8, True, 0.0)
+        self.assertFalse(c.clipped)
+        c.add(0.8, False, 1.0)
+        self.assertFalse(c.clipped)
+        c.add(0.8, True, 2.0)
+        self.assertTrue(c.clipped)
+        c.add(0.8, False, 3.0)
+        self.assertTrue(c.clipped)
+
+    def test_initial_state(self):
+        c = vs.MahCounter(mah=5.0, clipped=True)
+        self.assertEqual((c.mah, c.clipped), (5.0, True))
+
+
+class FormatPiMahTest(unittest.TestCase):
+    def test_with_mah(self):
+        self.assertEqual(vs.format_pi_line(7.2, 0.8, False, 5, 123.4), "PI 7.2V 0.8A 5% 123mAh")
+
+    def test_with_mah_clipped(self):
+        self.assertEqual(vs.format_pi_line(7.2, 0.8, True, 5, 123.4, True), "PI 7.2V 0.8A+ 5% 123mAh+")
+
+    def test_mah_without_pct(self):
+        self.assertEqual(vs.format_pi_line(7.2, 0.8, False, None, 0.0), "PI 7.2V 0.8A 0mAh")
+
+    def test_none_mah_unchanged(self):
+        self.assertEqual(vs.format_pi_line(7.2, 0.8, False, 5, None, True), "PI 7.2V 0.8A 5%")
+
+
+class MahStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "m.json")
+
+    def test_round_trip(self):
+        st = vs.MahStore(self.path, "boot-a")
+        st.save(vs.MahCounter(42.5, True), 0.0)
+        c = vs.MahStore(self.path, "boot-a").load()
+        self.assertEqual((c.mah, c.clipped), (42.5, True))
+
+    def test_file_format(self):
+        vs.MahStore(self.path, "boot-a").save(vs.MahCounter(1.5, False), 0.0)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f), {"boot_id": "boot-a", "mah": 1.5, "clipped": False})
+
+    def test_boot_id_mismatch(self):
+        vs.MahStore(self.path, "boot-a").save(vs.MahCounter(42.5, True), 0.0)
+        c = vs.MahStore(self.path, "boot-b").load()
+        self.assertEqual((c.mah, c.clipped), (0.0, False))
+
+    def test_corrupt(self):
+        for content in ("not json", "[]", '{"boot_id": "a", "mah": "x"}', '{"boot_id": "a"}'):
+            with open(self.path, "w") as f:
+                f.write(content)
+            c = vs.MahStore(self.path, "a").load()
+            self.assertEqual((c.mah, c.clipped), (0.0, False), content)
+
+    def test_missing(self):
+        c = vs.MahStore(self.path, "a").load()
+        self.assertEqual((c.mah, c.clipped), (0.0, False))
+
+    def test_save_throttle(self):
+        st = vs.MahStore(self.path, "a")
+        c = vs.MahCounter(1.0)
+        st.maybe_save(c, 100.0)
+        c.add(0.0, False, 0.0)
+        c.mah = 2.0
+        st.maybe_save(c, 109.0)
+        self.assertEqual(vs.MahStore(self.path, "a").load().mah, 1.0)
+        st.maybe_save(c, 110.0)
+        self.assertEqual(vs.MahStore(self.path, "a").load().mah, 2.0)
+
+    def test_save_swallows_oserror(self):
+        st = vs.MahStore(os.path.join(self.tmp.name, "no", "dir", "m.json"), "a")
+        st.maybe_save(vs.MahCounter(1.0), 0.0)
+
+    def test_no_temp_files_left(self):
+        vs.MahStore(self.path, "a").save(vs.MahCounter(1.0), 0.0)
+        self.assertEqual(os.listdir(self.tmp.name), ["m.json"])
+
+    def test_default_boot_id_reads_proc(self):
+        with mock.patch.object(vs, "read_boot_id", return_value="zzz"):
+            self.assertEqual(vs.MahStore(self.path).boot_id, "zzz")
 
 
 class GpsTest(unittest.TestCase):
