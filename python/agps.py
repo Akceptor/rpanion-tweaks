@@ -156,3 +156,39 @@ def build_assist(now, time_ok, pos, have_fix):
     if pos is not None:
         frames.append(mga_ini_pos_llh(pos.lat, pos.lon, pos.alt_m, pos.acc_m))
     return frames
+
+
+def _number(env, name, default, scale=1.0):
+    try:
+        v = float(env.get(name, default))
+    except ValueError:
+        raise ValueError(f"invalid {name}: not a number") from None
+    if not math.isfinite(v) or v < 0:
+        raise ValueError(f"invalid {name}: must be finite and >= 0")
+    return v * scale
+
+
+class Settings(NamedTuple):
+    enable: bool
+    mavlink: str
+    settle_s: float
+    cache_enabled: bool
+    cache_file: str
+    cache_max_age_s: float
+    cache_acc_m: float
+    manual: object
+    manual_acc_m: float
+
+    @classmethod
+    def from_env(cls, env):
+        return cls(
+            enable=env.get("AGPS_ENABLE", "1") != "0",
+            mavlink=env.get("AGPS_MAVLINK", "tcp:127.0.0.1:5760"),
+            settle_s=_number(env, "AGPS_SETTLE_S", "15"),
+            cache_enabled=env.get("AGPS_CACHE", "1") != "0",
+            cache_file=env.get("AGPS_CACHE_FILE", "/var/lib/agps/last_fix.json"),
+            cache_max_age_s=_number(env, "AGPS_CACHE_MAX_DAYS", "14", 86400),
+            cache_acc_m=_number(env, "AGPS_CACHE_ACC_KM", "25", 1000),
+            manual=parse_manual(env),
+            manual_acc_m=_number(env, "AGPS_APPROX_ACC_KM", "50", 1000),
+        )
