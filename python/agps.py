@@ -232,6 +232,7 @@ RESEND_AFTER_S = 30
 CACHE_INTERVAL_S = 900
 FRAME_GAP_S = 0.1
 STATUS_INTERVAL_S = 1
+ICON_HB_MAX_S = 3
 
 
 def status_datagram(pos):
@@ -298,7 +299,7 @@ class ApproxIcon:
 
 class Runner:
     def __init__(self, conn, settings, cache, clock=time.monotonic, wall=time.time,
-                 ntp=ntp_synced, sleep=time.sleep, status_send=None):
+                 ntp=ntp_synced, sleep=time.sleep, status_send=None, icon=None):
         self.conn = conn
         self.settings = settings
         self.cache = cache
@@ -307,6 +308,7 @@ class Runner:
         self.ntp = ntp
         self.sleep = sleep
         self.status_send = status_send
+        self.icon = icon
         self.armed = False
         self.last_save = None
         if not settings.cache_enabled:
@@ -323,6 +325,7 @@ class Runner:
         self.fix_at_detect = False
         self.chosen_pos = None
         self.status_t = None
+        self.icon_announced = False
 
     def link_lost(self):
         self._restart()
@@ -339,6 +342,23 @@ class Runner:
             self.armed = bool(m.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
         elif kind == "GPS_RAW_INT":
             self._on_gps(m)
+            self._icon_step(event=True)
+        elif kind == "GLOBAL_POSITION_INT" and self.icon is not None:
+            self.icon.fc_position(m)
+            self._icon_step(event=True)
+
+    def icon_active(self, now):
+        return (self.state == "SENT" and self.chosen_pos is not None and not self.good_fix
+                and self.last_hb is not None and now - self.last_hb <= ICON_HB_MAX_S)
+
+    def _icon_step(self, event):
+        if self.icon is None:
+            return
+        active = self.icon_active(self.clock())
+        if active and not self.icon_announced:
+            self.icon_announced = True
+            self.conn.mav.statustext_send(mavlink.MAV_SEVERITY_NOTICE, STATUSTEXT_ICON)
+        self.icon.update(self.chosen_pos, active, event)
 
     def _on_gps(self, m):
         now = self.clock()
@@ -376,6 +396,7 @@ class Runner:
                 self.status_t is None or now - self.status_t >= STATUS_INTERVAL_S):
             self.status_send(status_datagram(self.chosen_pos))
             self.status_t = now
+        self._icon_step(event=False)
 
     def send_bundle(self, have_fix):
         wall = self.wall()
