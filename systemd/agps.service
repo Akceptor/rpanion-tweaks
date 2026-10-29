@@ -1,0 +1,16 @@
+[Unit]
+Description=Boot-time GPS assist (u-blox AssistNow Autonomous + time/position)
+After=rpanion-server.service
+
+[Service]
+User=rpanion
+EnvironmentFile=-/etc/agps.env
+ExecStart=/usr/bin/python3 /usr/local/lib/agps/agps.py
+StateDirectory=agps
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

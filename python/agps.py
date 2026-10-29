@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
+import argparse
 import datetime
 import json
 import logging
 import math
 import os
+import signal
 import struct
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from typing import NamedTuple
 
@@ -303,3 +307,88 @@ class Runner:
             self.conn.mav.gps_inject_data_send(FC[0], FC[1], n, data)
         parts = ["valset"] + (["time"] if time_ok else []) + ([f"pos={pos.source}"] if pos else [])
         logging.info("agps: sent %s", ",".join(parts))
+
+
+WAIT_HEARTBEAT_S = 10
+PROBE_WAIT_S = 5
+
+
+def _from_fc(m):
+    return m is not None and m.get_srcSystem() == FC[0] and m.get_srcComponent() == FC[1]
+
+
+def _wait_for(conn, kind, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        m = conn.recv_match(type=kind, blocking=True, timeout=1)
+        if _from_fc(m) and m.get_type() == kind:
+            return m
+    return None
+
+
+def serve(conn, runner, stop):
+    while not stop.is_set():
+        m = conn.recv_match(blocking=True, timeout=0.5)
+        if m is not None and m.get_type() != "BAD_DATA":
+            runner.handle(m)
+        runner.tick()
+
+
+def main(argv=None, env=os.environ, connect=None):
+    if connect is None:
+        from pymavlink import mavutil
+        connect = mavutil.mavlink_connection
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
+    parser = argparse.ArgumentParser(prog="agps")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("run")
+    sub.add_parser("probe")
+    sub.add_parser("inject")
+    sub.add_parser("reset").add_argument("mode", choices=sorted(RESET_MASKS))
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
+    try:
+        settings = Settings.from_env(env)
+    except ValueError as e:
+        print(f"agps: {e}", file=sys.stderr)
+        return 2
+    if not settings.enable:
+        return 0
+    conn = connect(settings.mavlink, source_system=1, source_component=193, autoreconnect=True)
+    cmd = args.cmd or "run"
+    cache = FixCache(settings.cache_file)
+
+    if cmd == "run":
+        runner = Runner(conn, settings, cache)
+        stop = threading.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: stop.set())
+        serve(conn, runner, stop)
+        return 0
+
+    hb = _wait_for(conn, "HEARTBEAT", WAIT_HEARTBEAT_S)
+    if hb is None:
+        print("agps: no heartbeat from the FC", file=sys.stderr)
+        return 1
+    if cmd == "probe":
+        conn.mav.gps_inject_data_send(FC[0], FC[1], *to_inject(mon_ver_poll()))
+        st = _wait_for(conn, "STATUSTEXT", PROBE_WAIT_S)
+        if st is None:
+            print("agps: no u-blox version reply", file=sys.stderr)
+            return 1
+        print(st.text)
+        return 0
+    if cmd == "reset":
+        if hb.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+            print("agps: refusing to reset the GPS while armed", file=sys.stderr)
+            return 3
+        conn.mav.gps_inject_data_send(FC[0], FC[1], *to_inject(cfg_rst(RESET_MASKS[args.mode])))
+        return 0
+    Runner(conn, settings, cache).send_bundle(have_fix=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
