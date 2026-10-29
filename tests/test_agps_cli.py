@@ -1,5 +1,6 @@
 import contextlib
 import io
+import logging
 import threading
 import unittest
 
@@ -113,6 +114,103 @@ class CliTest(unittest.TestCase):
 
         agps.serve(conn, R(), stop)
         self.assertEqual(calls, ["HEARTBEAT", "tick", "GPS_RAW_INT", "tick", "tick"])
+
+    def test_serve_reconnects_after_reset(self):
+        stop = threading.Event()
+        events = []
+
+        class Dead:
+            def recv_match(self, **k):
+                raise ConnectionResetError(104, "Connection reset by peer")
+
+        new = QueueConn([gps(3)], on_empty=stop.set)
+
+        class R:
+            conn = None
+
+            def handle(self, m):
+                events.append(m.get_type())
+
+            def tick(self):
+                pass
+
+            def link_lost(self):
+                events.append("lost")
+
+        r = R()
+        waits = []
+        with self.assertLogs(level=logging.WARNING) as cm:
+            agps.serve(Dead(), r, stop, reconnect=lambda: new, wait=waits.append)
+        self.assertEqual(events, ["lost", "GPS_RAW_INT"])
+        self.assertIs(r.conn, new)
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(len(cm.output), 1)
+        self.assertNotIn("Traceback", cm.output[0])
+
+    def test_serve_backs_off_while_reconnect_fails(self):
+        stop = threading.Event()
+
+        class Dead:
+            def recv_match(self, **k):
+                raise BrokenPipeError()
+
+        class R:
+            conn = None
+
+            def handle(self, m):
+                pass
+
+            def tick(self):
+                pass
+
+            def link_lost(self):
+                pass
+
+        attempts = []
+        new = QueueConn([], on_empty=stop.set)
+
+        def reconnect():
+            attempts.append(1)
+            if len(attempts) < 4:
+                raise ConnectionRefusedError()
+            return new
+
+        waits = []
+        with self.assertLogs(level=logging.WARNING):
+            agps.serve(Dead(), R(), stop, reconnect=reconnect, wait=waits.append)
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(waits, sorted(waits))
+        self.assertLessEqual(max(waits), 10)
+
+    def test_serve_tick_error_also_reconnects(self):
+        stop = threading.Event()
+        new = QueueConn([], on_empty=stop.set)
+        lost = []
+
+        class R:
+            conn = None
+
+            def handle(self, m):
+                pass
+
+            def tick(self):
+                if not lost:
+                    raise BrokenPipeError()
+
+            def link_lost(self):
+                lost.append(1)
+
+        with self.assertLogs(level=logging.WARNING):
+            agps.serve(QueueConn([heartbeat()]), R(), stop, reconnect=lambda: new, wait=lambda s: None)
+        self.assertEqual(lost, [1])
+
+    def test_serve_without_reconnect_propagates(self):
+        class Dead:
+            def recv_match(self, **k):
+                raise ConnectionResetError()
+
+        with self.assertRaises(ConnectionResetError):
+            agps.serve(Dead(), object(), threading.Event())
 
 
 if __name__ == "__main__":

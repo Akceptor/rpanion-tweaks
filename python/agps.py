@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
+import itertools
 import json
 import logging
 import math
@@ -277,6 +278,9 @@ class Runner:
         self.chosen_pos = None
         self.status_t = None
 
+    def link_lost(self):
+        self._restart()
+
     def handle(self, m):
         if m.get_srcSystem() != FC[0] or m.get_srcComponent() != FC[1]:
             return
@@ -364,12 +368,43 @@ def _wait_for(conn, kind, timeout_s):
     return None
 
 
-def serve(conn, runner, stop):
+RECONNECT_BACKOFF_S = (1, 2, 5, 10)
+
+
+def _reconnect(reconnect, runner, stop, wait, why):
+    logging.warning("agps: FC link lost (%s), reconnecting", why)
+    runner.link_lost()
+    for attempt in itertools.count():
+        wait(RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)])
+        if stop.is_set():
+            return None
+        try:
+            return reconnect()
+        except Exception as e:
+            logging.warning("agps: reconnect failed (%s)", type(e).__name__)
+
+
+def serve(conn, runner, stop, reconnect=None, wait=None):
+    # pymavlink's autoreconnect covers send, not recv: a router restart resets the socket
+    # and recv_match raises.
+    wait = wait or stop.wait
     while not stop.is_set():
-        m = conn.recv_match(blocking=True, timeout=0.5)
-        if m is not None and m.get_type() != "BAD_DATA":
-            runner.handle(m)
-        runner.tick()
+        try:
+            m = conn.recv_match(blocking=True, timeout=0.5)
+            if m is not None and m.get_type() != "BAD_DATA":
+                runner.handle(m)
+            runner.tick()
+        except OSError as e:
+            if reconnect is None:
+                raise
+            try:
+                conn.close()
+            except Exception:
+                pass
+            new = _reconnect(reconnect, runner, stop, wait, type(e).__name__)
+            if new is None:
+                return
+            conn = runner.conn = new
 
 
 def main(argv=None, env=os.environ, connect=None):
@@ -404,7 +439,8 @@ def main(argv=None, env=os.environ, connect=None):
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
-        serve(conn, runner, stop)
+        serve(conn, runner, stop, reconnect=lambda: connect(
+            settings.mavlink, source_system=1, source_component=193, autoreconnect=True))
         return 0
 
     hb = _wait_for(conn, "HEARTBEAT", WAIT_HEARTBEAT_S)
