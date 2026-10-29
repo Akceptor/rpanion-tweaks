@@ -11,6 +11,8 @@ from typing import List
 import subprocess
 import os
 import time
+import math
+import json
 import threading
 import socket
 import struct
@@ -284,7 +286,17 @@ def hdop_rating(hdop: float) -> str:
     return "Poor"
 
 
-def gps_line(state: dict, now: float) -> str:
+def approx_line(approx, coord) -> str:
+    source, acc_m, lat, lon = approx
+    km = max(1, round(acc_m / 1000))
+    if coord is None:
+        return "≈ {0} ±{1} km".format(source, km)
+    lat, lon = coord(lat, lon)
+    return "≈ {0:.2f} {1:.2f} ({2} ±{3} km)".format(lat, lon, source, km)
+
+
+# coord: (lat, lon) -> (lat, lon), or None to hide coordinates. approx: fresh AGPS tuple or None
+def gps_line(state: dict, now: float, coord, approx=None) -> str:
     if "gps" not in state or now - state["gps_ts"] > 5:
         return ""
     fix, sats, eph, lat, lon = state["gps"]
@@ -296,7 +308,10 @@ def gps_line(state: dict, now: float) -> str:
         hdop = eph / 100
         lines.append("HDOP {0} ({1:.1f})".format(hdop_rating(hdop), hdop))
     if fix >= 2:
-        lines.append("{0:.6f} {1:.6f}".format(lat / 1e7, lon / 1e7))
+        if coord is not None:
+            lines.append("{0:.6f} {1:.6f}".format(*coord(lat / 1e7, lon / 1e7)))
+    elif approx is not None:
+        lines.append(approx_line(approx, coord))
     return "\n".join(lines)
 
 
@@ -452,9 +467,96 @@ def apply_lima(state: dict, data: bytes, now: float):
         state["ts"] = now
 
 
+def lima_on(state: dict, now: float) -> bool:
+    return bool(state.get("on")) and now - state["ts"] <= 3
+
+
 def lima_line(state: dict, now: float) -> str:
-    on = state.get("on") and now - state["ts"] <= 3
-    return "Lima: ON" if on else "Lima: OFF"
+    return "Lima: ON" if lima_on(state, now) else "Lima: OFF"
+
+
+R_EARTH = 6378137.0
+
+
+# Same math and validation as Anchor/AnchorStore.load in lima.py. Duplicated because
+# lima.py imports pymavlink at top level, which isn't installed in the video server's Python.
+class HudAnchor:
+    def __init__(self, real_lat, real_lon, fake_lat, fake_lon):
+        self.real_lat, self.real_lon = real_lat, real_lon
+        self.fake_lat, self.fake_lon = fake_lat, fake_lon
+
+    def to_fake(self, lat, lon):
+        d_n = (lat - self.real_lat) * R_EARTH * math.pi / 180
+        d_e = (lon - self.real_lon) * R_EARTH * math.cos(math.radians(self.real_lat)) * math.pi / 180
+        return (
+            self.fake_lat + d_n / (R_EARTH * math.pi / 180),
+            self.fake_lon + d_e / (R_EARTH * math.cos(math.radians(self.fake_lat)) * math.pi / 180),
+        )
+
+
+def load_anchor(path: str):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        vals = [float(d[k]) for k in ("real_lat", "real_lon", "fake_lat", "fake_lon")]
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
+        return None
+    if not all(math.isfinite(v) for v in vals):
+        return None
+    if abs(vals[0]) > 90 or abs(vals[2]) > 90 or abs(vals[1]) > 180 or abs(vals[3]) > 180:
+        return None
+    return HudAnchor(*vals)
+
+
+# Lima ON without an anchor returns None: hide coordinates rather than leak real ones
+def coord_policy(on: bool, anchor):
+    if not on:
+        return lambda lat, lon: (lat, lon)
+    return anchor.to_fake if anchor is not None else None
+
+
+def parse_agps(data: bytes):
+    try:
+        parts = data.decode("ascii").split()
+        if len(parts) != 5 or parts[0] != "AGPS" or parts[1] not in ("cache", "manual"):
+            return None
+        acc = int(parts[2])
+        lat, lon = float(parts[3]), float(parts[4])
+    except ValueError:
+        return None
+    if acc <= 0 or not (math.isfinite(lat) and math.isfinite(lon)) or abs(lat) > 90 or abs(lon) > 180:
+        return None
+    return parts[1], acc, lat, lon
+
+
+def apply_agps(state: dict, data: bytes, now: float):
+    parsed = parse_agps(data)
+    if parsed:
+        state["agps"] = parsed
+        state["ts"] = now
+
+
+def agps_approx(state: dict, now: float):
+    if "agps" in state and now - state["ts"] <= 3:
+        return state["agps"]
+    return None
+
+
+class AgpsStatus(threading.Thread):
+    def __init__(self, port: int):
+        super().__init__(daemon=True)
+        self.port = port
+        self.state = {}
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("127.0.0.1", self.port))
+        except OSError as e:
+            print("AGPS overlay: cannot bind UDP 127.0.0.1:{0} ({1}), approx position disabled".format(self.port, e))
+            return
+        while True:
+            apply_agps(self.state, sock.recv(128), time.monotonic())
 
 
 # Listens for the status datagrams that lima.py sends once per second
@@ -590,6 +692,7 @@ class SystemStats(threading.Thread):
             if cls._instance.mavlink.enabled:
                 cls._instance.mavlink.sender.start()
             cls._instance.lima.start()
+            cls._instance.agps.start()
         return cls._instance
 
     def __init__(self):
@@ -600,6 +703,8 @@ class SystemStats(threading.Thread):
         self.uptime_text = ""
         self.mavlink = MavlinkBattery(env_number("STATS_MAVLINK_PORT", 14570))
         self.lima = LimaStatus(env_number("STATS_LIMA_PORT", 14571))
+        self.agps = AgpsStatus(env_number("STATS_AGPS_PORT", 14572))
+        self.anchor_path = os.environ.get("LIMA_ANCHOR_FILE", "/run/lima/anchor.json")
         self.ina = Ina226()
 
     def run(self):
@@ -649,7 +754,9 @@ class SystemStats(threading.Thread):
                 net += " | " + slow["signal"]
             self.lines = [net, " | ".join(sys_parts)]
             self.batt_lines = [fc_line(self.mavlink.state, now), self.ina.line(now)]
-            self.gps_text = gps_line(self.mavlink.state, now)
+            anchor = load_anchor(self.anchor_path)
+            coord = coord_policy(lima_on(self.lima.state, now), anchor)
+            self.gps_text = gps_line(self.mavlink.state, now, coord, agps_approx(self.agps.state, now))
             self.uptime_text = format_uptime(read_uptime())
             self.mavlink.send_batt2(self.ina.last, now)
 

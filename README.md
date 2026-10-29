@@ -26,7 +26,7 @@ PI 7.6V 1.2A 68%
 | `fps` | frames reaching the encoder | Per viewer |
 | `FC ...` (bottom left) | MAVLink `SYS_STATUS` / `BATTERY_STATUS` over UDP | Flight controller battery. Hidden if no data for 5 s. See [Battery overlay](#battery-overlay) |
 | `PI ...` (bottom left) | INA226 on I2C | Companion battery, measured before the BEC. Hidden if the sensor is absent. See [Battery overlay](#battery-overlay) |
-| `GPS 3D 12 sats`, `HDOP Good (1.2)`, lat/lon (bottom right) | MAVLink `GPS_RAW_INT` over UDP | FC GPS fix, satellites, HDOP with rating (Excellent <= 1, Good <= 2, Usable <= 5, else Poor); coordinates shown from 2D fix up. Hidden if no data for 5 s |
+| `GPS 3D 12 sats`, `HDOP Good (1.2)`, lat/lon (bottom right) | MAVLink `GPS_RAW_INT` over UDP | FC GPS fix, satellites, HDOP with rating (Excellent <= 1, Good <= 2, Usable <= 5, else Poor); coordinates shown from 2D fix up. Hidden if no data for 5 s. Coordinates follow Lima state: shifted like the GCS map while `Lima: ON`, hidden if Lima has no anchor yet. Without a fix, an `≈ lat lon (cache ±N km)` line shows the approximate position from the agps service (UDP `127.0.0.1:14572`, `AGPS <cache\|manual> <acc_m> <lat> <lon>`) |
 | `Lima: ON/OFF` (bottom centre) | Lima status UDP `127.0.0.1:14571` | ON while a GCS is connected to Lima, OFF otherwise (including Lima not installed or stopped). See [Lima](#lima-fake-position-on-the-gcs-map) |
 
 Fields that aren't available on your hardware are hidden. Slow commands (`vcgencmd`, `mmcli`) run every 5 s in a background thread so they never stall the video.
@@ -140,6 +140,8 @@ Set them like `STATS_IFACE` above (`sudo systemctl edit rpanion-server`, then ad
 |---|---|---|
 | `STATS_MAVLINK_PORT` | `14570` | UDP port on 127.0.0.1 for the FC battery |
 | `STATS_LIMA_PORT` | `14571` | UDP port on 127.0.0.1 for the Lima ON/OFF status |
+| `STATS_AGPS_PORT` | `14572` | UDP port on 127.0.0.1 for the agps approximate position |
+| `LIMA_ANCHOR_FILE` | `/run/lima/anchor.json` | Lima anchor file the HUD reads to shift coordinates |
 | `MAVLINK_BATT2` | `1` | Send the Pi battery to the GCS as battery 2. `0` turns it off |
 | `MAVLINK_BATT2_COMPID` | `1` | MAVLink component id used for that message. `191` (onboard computer) works for GCSs that show other components, not Mission Planner |
 | `MAVLINK_BATT2_TCP` | `127.0.0.1:5760` | mavlink-router TCP server (`host:port`) used to send it |

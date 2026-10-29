@@ -67,6 +67,9 @@ def gps_payload(fix=3, sats=12, eph=121, lat=501234567, lon=-301234567):
     return bytes(p)
 
 
+IDENT = lambda lat, lon: (lat, lon)
+
+
 class CrcTest(unittest.TestCase):
     def test_reference_vector(self):
         self.assertEqual(vs.crc_x25(b"123456789"), 0x6F91)
@@ -512,29 +515,29 @@ class GpsTest(unittest.TestCase):
     def test_other_component_ignored(self):
         st = {}
         vs.apply_mavlink(st, 24, 191, gps_payload(), 100.0)
-        self.assertEqual(vs.gps_line(st, 100.0), "")
+        self.assertEqual(vs.gps_line(st, 100.0, IDENT), "")
 
     def test_no_fix(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(fix=1, sats=0, eph=9999, lat=0, lon=0), 100.0)
-        self.assertEqual(vs.gps_line(st, 101.0), "GPS NO FIX 0 sats\nHDOP Poor (100.0)")
+        self.assertEqual(vs.gps_line(st, 101.0, IDENT), "GPS NO FIX 0 sats\nHDOP Poor (100.0)")
 
     def test_3d_with_coords(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(), 100.0)
-        self.assertEqual(vs.gps_line(st, 101.0), "GPS 3D 12 sats\nHDOP Good (1.2)\n50.123457 -30.123457")
+        self.assertEqual(vs.gps_line(st, 101.0, IDENT), "GPS 3D 12 sats\nHDOP Good (1.2)\n50.123457 -30.123457")
 
     def test_unknown_sats_and_hdop(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(fix=6, sats=255, eph=65535), 100.0)
-        self.assertEqual(vs.gps_line(st, 100.0), "GPS RTK FIX\n50.123457 -30.123457")
+        self.assertEqual(vs.gps_line(st, 100.0, IDENT), "GPS RTK FIX\n50.123457 -30.123457")
 
     def test_hdop_rating_line(self):
         for eph, text in ((50, "HDOP Excellent (0.5)"), (140, "HDOP Good (1.4)"),
                           (240, "HDOP Usable (2.4)"), (9999, "HDOP Poor (100.0)")):
             st = {}
             vs.apply_mavlink(st, 24, 1, gps_payload(eph=eph), 100.0)
-            self.assertEqual(vs.gps_line(st, 100.0).split("\n")[1], text)
+            self.assertEqual(vs.gps_line(st, 100.0, IDENT).split("\n")[1], text)
 
     def test_hdop_rating_boundaries(self):
         for hdop, rating in ((0.0, "Excellent"), (1.0, "Excellent"), (1.01, "Good"), (2.0, "Good"),
@@ -545,21 +548,21 @@ class GpsTest(unittest.TestCase):
         for eph, rating in ((100, "Excellent"), (200, "Good"), (500, "Usable"), (501, "Poor")):
             st = {}
             vs.apply_mavlink(st, 24, 1, gps_payload(eph=eph), 100.0)
-            self.assertIn(rating, vs.gps_line(st, 100.0).split("\n")[1])
+            self.assertIn(rating, vs.gps_line(st, 100.0, IDENT).split("\n")[1])
 
     def test_unknown_fix_name(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(fix=9, sats=5, eph=65535), 100.0)
-        self.assertTrue(vs.gps_line(st, 100.0).startswith("GPS FIX9 5 sats\n"))
+        self.assertTrue(vs.gps_line(st, 100.0, IDENT).startswith("GPS FIX9 5 sats\n"))
 
     def test_stale(self):
         st = {}
         vs.apply_mavlink(st, 24, 1, gps_payload(), 100.0)
-        self.assertEqual(vs.gps_line(st, 105.0).split("\n")[0], "GPS 3D 12 sats")
-        self.assertEqual(vs.gps_line(st, 105.1), "")
+        self.assertEqual(vs.gps_line(st, 105.0, IDENT).split("\n")[0], "GPS 3D 12 sats")
+        self.assertEqual(vs.gps_line(st, 105.1, IDENT), "")
 
     def test_empty(self):
-        self.assertEqual(vs.gps_line({}, 100.0), "")
+        self.assertEqual(vs.gps_line({}, 100.0, IDENT), "")
 
     def test_independent_of_sys_status(self):
         st = {}
@@ -583,6 +586,114 @@ class UptimeTest(unittest.TestCase):
     def test_read_missing(self):
         with mock.patch("builtins.open", side_effect=FileNotFoundError):
             self.assertIsNone(vs.read_uptime())
+
+
+class HudLimaCoordsTests(unittest.TestCase):
+    def write(self, text):
+        import tempfile
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "anchor.json")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def anchor(self):
+        return vs.HudAnchor(50.0, 24.0, -12.0, -77.0)
+
+    def gps_state(self, fix=3, lat=500000000, lon=240000000):
+        st = {}
+        vs.apply_mavlink(st, 24, 1, gps_payload(fix=fix, sats=12, eph=121, lat=lat, lon=lon), 100.0)
+        return st
+
+    def test_to_fake_north_offset(self):
+        lat, lon = self.anchor().to_fake(50.01, 24.0)
+        self.assertAlmostEqual(lat, -12.0 + 0.01, places=9)
+        self.assertAlmostEqual(lon, -77.0, places=9)
+
+    def test_to_fake_east_offset_scales_by_cos(self):
+        import math
+        lat, lon = self.anchor().to_fake(50.0, 24.01)
+        self.assertAlmostEqual(lat, -12.0, places=9)
+        want = -77.0 + 0.01 * math.cos(math.radians(50)) / math.cos(math.radians(-12))
+        self.assertAlmostEqual(lon, want, places=9)
+
+    def test_load_anchor_valid(self):
+        a = vs.load_anchor(self.write('{"real_lat": 50, "real_lon": 24, "fake_lat": -12, "fake_lon": -77}'))
+        self.assertEqual((a.real_lat, a.real_lon, a.fake_lat, a.fake_lon), (50.0, 24.0, -12.0, -77.0))
+
+    def test_load_anchor_bad(self):
+        self.assertIsNone(vs.load_anchor("/nonexistent/anchor.json"))
+        self.assertIsNone(vs.load_anchor(self.write("not json")))
+        self.assertIsNone(vs.load_anchor(self.write("[1,2]")))
+        self.assertIsNone(vs.load_anchor(self.write('{"real_lat": 50}')))
+        self.assertIsNone(vs.load_anchor(self.write('{"real_lat": 91, "real_lon": 24, "fake_lat": -12, "fake_lon": -77}')))
+        self.assertIsNone(vs.load_anchor(self.write('{"real_lat": 50, "real_lon": 24, "fake_lat": -12, "fake_lon": 181}')))
+        self.assertIsNone(vs.load_anchor(self.write('{"real_lat": NaN, "real_lon": 24, "fake_lat": -12, "fake_lon": -77}')))
+        self.assertIsNone(vs.load_anchor(self.write('{"real_lat": "x", "real_lon": 24, "fake_lat": -12, "fake_lon": -77}')))
+
+    def test_coord_policy(self):
+        a = self.anchor()
+        self.assertEqual(vs.coord_policy(False, None)(1.0, 2.0), (1.0, 2.0))
+        self.assertEqual(vs.coord_policy(False, a)(1.0, 2.0), (1.0, 2.0))
+        self.assertEqual(vs.coord_policy(True, a), a.to_fake)
+        self.assertIsNone(vs.coord_policy(True, None))
+
+    def test_lima_on(self):
+        self.assertFalse(vs.lima_on({}, 100.0))
+        st = {}
+        vs.apply_lima(st, b"LIMA 1", 100.0)
+        self.assertTrue(vs.lima_on(st, 103.0))
+        self.assertFalse(vs.lima_on(st, 103.1))
+
+    def test_parse_agps_valid(self):
+        self.assertEqual(vs.parse_agps(b"AGPS cache 25000 50.5 24.25"), ("cache", 25000, 50.5, 24.25))
+        self.assertEqual(vs.parse_agps(b"AGPS manual 1 -12.0 -77.0"), ("manual", 1, -12.0, -77.0))
+
+    def test_parse_agps_malformed(self):
+        for bad in (b"", b"AGPS", b"AGPS cache 25000 50.5", b"AGPS cache 25000 50.5 24 9",
+                    b"XGPS cache 25000 50.5 24", b"AGPS wifi 25000 50.5 24",
+                    b"AGPS cache abc 50.5 24", b"AGPS cache 2.5 50.5 24", b"AGPS cache 0 50.5 24",
+                    b"AGPS cache -5 50.5 24", b"AGPS cache 100 x 24", b"AGPS cache 100 nan 24",
+                    b"AGPS cache 100 50 inf", b"AGPS cache 100 91 24", b"AGPS cache 100 50 181",
+                    b"\xff\xfe"):
+            self.assertIsNone(vs.parse_agps(bad), bad)
+
+    def test_agps_approx_freshness(self):
+        st = {}
+        vs.apply_agps(st, b"garbage", 100.0)
+        self.assertIsNone(vs.agps_approx(st, 100.0))
+        vs.apply_agps(st, b"AGPS cache 25000 50.5 24.25", 100.0)
+        self.assertEqual(vs.agps_approx(st, 103.0), ("cache", 25000, 50.5, 24.25))
+        self.assertIsNone(vs.agps_approx(st, 103.1))
+
+    def test_gps_line_real_and_hidden(self):
+        st = self.gps_state()
+        self.assertEqual(vs.gps_line(st, 100.0, IDENT), "GPS 3D 12 sats\nHDOP Good (1.2)\n50.000000 24.000000")
+        self.assertEqual(vs.gps_line(st, 100.0, None), "GPS 3D 12 sats\nHDOP Good (1.2)")
+
+    def test_gps_line_fake(self):
+        st = self.gps_state(lat=500100000)
+        out = vs.gps_line(st, 100.0, self.anchor().to_fake)
+        self.assertEqual(out.split("\n")[2], "-11.990000 -77.000000")
+
+    def test_approx_line_only_without_fix(self):
+        ap = ("cache", 25000, 50.5, 24.25)
+        st = self.gps_state(fix=1)
+        self.assertEqual(vs.gps_line(st, 100.0, IDENT, ap).split("\n")[-1], "≈ 50.50 24.25 (cache ±25 km)")
+        self.assertEqual(vs.gps_line(self.gps_state(fix=3), 100.0, IDENT, ap).count("≈"), 0)
+        self.assertEqual(vs.gps_line(self.gps_state(fix=2), 100.0, IDENT, ap).count("≈"), 0)
+        self.assertEqual(vs.gps_line(st, 100.0, IDENT, None).count("≈"), 0)
+
+    def test_approx_line_km_rounding(self):
+        st = self.gps_state(fix=0)
+        self.assertTrue(vs.gps_line(st, 100.0, IDENT, ("manual", 200, 1.0, 2.0)).endswith("(manual ±1 km)"))
+        self.assertTrue(vs.gps_line(st, 100.0, IDENT, ("manual", 1600, 1.0, 2.0)).endswith("(manual ±2 km)"))
+
+    def test_approx_line_shifted_and_hidden(self):
+        st = self.gps_state(fix=1)
+        ap = ("cache", 25000, 50.01, 24.0)
+        self.assertEqual(vs.gps_line(st, 100.0, self.anchor().to_fake, ap).split("\n")[-1], "≈ -11.99 -77.00 (cache ±25 km)")
+        self.assertEqual(vs.gps_line(st, 100.0, None, ap).split("\n")[-1], "≈ cache ±25 km")
 
 
 if __name__ == "__main__":
