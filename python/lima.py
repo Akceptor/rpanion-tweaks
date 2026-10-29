@@ -300,6 +300,11 @@ class Rewriter:
                 msg.lat = round(self.fake_anchor[0] * 1e7)
                 msg.lon = round(self.fake_anchor[1] * 1e7)
                 return repack(msg, self._out)
+            if to_fake and name in ("GPS_RAW_INT", "GPS2_RAW"):
+                # Zeroed, not dropped: a GCS that gets no GPS_RAW_INT shows "No GPS" instead of "No Fix".
+                setattr(msg, lat_f, 0)
+                setattr(msg, lon_f, 0)
+                return repack(msg, self._out)
             if not to_fake:
                 self._warn(name, "no anchor")
             return None

@@ -165,7 +165,7 @@ FC ─ mavlink-routerd ─┬─ 14540 Rpanion, 14541 DF logger, 14570 HUD   (re
 ```
 
 - The rover's first good GPS fix (3D or better) after Lima starts maps to the Lima point. No reference point to set.
-- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one. The one exception is `GLOBAL_POSITION_INT`: its coordinates are replaced with the Lima point, so the icon (for example agps's approximate-position icon, see AGPS "Map icon") sits on the Lima point before the first fix. The real coordinate never leaves Lima.
+- Until that fix, position messages are dropped in both directions: the GCS shows no position rather than the real one. The one exception is `GLOBAL_POSITION_INT`: its coordinates are replaced with the Lima point, so the icon (for example agps's approximate-position icon, see AGPS "Map icon") sits on the Lima point before the first fix. `GPS_RAW_INT` and `GPS2_RAW` also pass before the first fix, with lat/lon zeroed, so the GCS shows "No Fix" rather than "No GPS". The real coordinate never leaves Lima.
 - The anchor and the uplink guard's reference position come only from `GPS_RAW_INT` fixes (3D or better), never from `GLOBAL_POSITION_INT`. The guard reference updates at the `GPS_RAW_INT` rate and keeps the last fix during a GPS outage.
 - The shift is in metres, so distances and headings on the map match reality. Altitude is unchanged.
 - Fails closed: a crash, a missing setting, or a message with a position Lima can't convert means the GCS gets nothing, never the real value.
