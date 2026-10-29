@@ -307,6 +307,19 @@ Rollback: set `AGPS_MAP_ICON=0` in `/etc/agps.env` and `sudo systemctl restart a
 
 If mavlink-router restarts, agps logs `FC link lost`, restarts its state machine and reconnects with a 1 to 10 s backoff instead of exiting.
 
+### Check the map icon on hardware
+
+Deploy `python/agps.py`, `python/lima.py` and `python/video-server.py` together (see Install), restart `agps`, `lima` and the video service. Use a GPS with no fix (indoors or antenna covered) and a cache or manual position (`journalctl -u agps` shows `pos=cache|manual`).
+
+1. FC untouched: no new prearm or EKF messages, `HOME_POSITION` unchanged, `EKF_STATUS_REPORT` flags the same as with `AGPS_MAP_ICON=0`. In QGC's MAVLink Inspector (Lima OFF), `GLOBAL_POSITION_INT` from 1/1 alternates between the FC's `0,0` and ours.
+2. QGC on `14550` (Lima OFF): the icon appears about 15 s after GPS detection at the approximate point and stays put for 2 min with no jump to 0,0. Altitude steady. One `AGPS: map icon approximate until GPS fix` notice (note if QGC doesn't show it). HUD `≈` shows the same 2 decimals.
+3. QGC on Lima `14551` right after a Pi reboot: the icon sits on the Lima fake point and the HUD shows `≈ -12.07 -77.04`. No message in the MAVLink Inspector carries a real coordinate. `/run/lima/anchor.json` does not exist while the icon is spoofed.
+4. First fix, outdoors: the HUD switches to the fix line. With Lima ON the icon stays near the fake point and starts tracking, and the anchor file appears; its `real_lat/real_lon` is within about 50 m of the real fix. Note how long QGC on `14550` keeps the approximate icon after the fix.
+5. Lima ON with an anchor: with the Pi up, power-cycle only the FC indoors. After agps's resend the icon shows `to_fake(approx)` and the HUD the same 2 decimals. A "Go to location" click near that icon is refused by Lima, never sent.
+6. Mission Planner on `14550`: icon at the approximate point. Note how often it flashes to 0,0.
+7. Rollback: `AGPS_MAP_ICON=0` + `sudo systemctl restart agps`, power-cycle the FC: no icon before the fix, the HUD `≈` line stays.
+8. Router restart: `sudo systemctl restart rpanion-server`. `journalctl -u agps` shows one `FC link lost` line, no traceback and no service restart, and the icon returns after the next `SENT`.
+
 ### Privacy
 
 The cache stores your area (rounded to ~1 km) in `/var/lib/agps/last_fix.json` on the SD card, mode 0600. `AGPS_CACHE=0` turns it off and deletes the file. Injected data goes only to the FC. Logs never contain coordinates.
