@@ -60,6 +60,13 @@ def batt_status_payload(mah=1250, batt_id=0):
     return bytes(p)
 
 
+def gps_payload(fix=3, sats=12, eph=121, lat=501234567, lon=-301234567):
+    p = bytearray(30)
+    struct.pack_into("<qiiiHHHH", p, 0, 0, lat, lon, 0, eph, 0, 0, 0)
+    p[28], p[29] = fix, sats
+    return bytes(p)
+
+
 class CrcTest(unittest.TestCase):
     def test_reference_vector(self):
         self.assertEqual(vs.crc_x25(b"123456789"), 0x6F91)
@@ -490,6 +497,92 @@ class Ina226ReadingTest(unittest.TestCase):
         ina.next_try = 1e9
         self.assertEqual(ina.line(2.0), "")
         self.assertIsNone(ina.last)
+
+
+class GpsTest(unittest.TestCase):
+    def test_decode(self):
+        self.assertEqual(vs.decode_gps_raw(gps_payload()), (3, 12, 121, 501234567, -301234567))
+
+    def test_parser_accepts_truncated_v2(self):
+        payload = gps_payload(fix=1, sats=0, eph=9999, lat=0, lon=0)
+        frame = v2_frame(24, payload, 24)
+        self.assertLess(len(frame), 10 + 30 + 2)
+        self.assertEqual(vs.parse_mavlink_frames(frame), [(24, 1, payload, 1)])
+
+    def test_other_component_ignored(self):
+        st = {}
+        vs.apply_mavlink(st, 24, 191, gps_payload(), 100.0)
+        self.assertEqual(vs.gps_line(st, 100.0), "")
+
+    def test_no_fix(self):
+        st = {}
+        vs.apply_mavlink(st, 24, 1, gps_payload(fix=1, sats=0, eph=9999, lat=0, lon=0), 100.0)
+        self.assertEqual(vs.gps_line(st, 101.0), "GPS NO FIX 0 sats\nHDOP Poor (100.0)")
+
+    def test_3d_with_coords(self):
+        st = {}
+        vs.apply_mavlink(st, 24, 1, gps_payload(), 100.0)
+        self.assertEqual(vs.gps_line(st, 101.0), "GPS 3D 12 sats\nHDOP Good (1.2)\n50.123457 -30.123457")
+
+    def test_unknown_sats_and_hdop(self):
+        st = {}
+        vs.apply_mavlink(st, 24, 1, gps_payload(fix=6, sats=255, eph=65535), 100.0)
+        self.assertEqual(vs.gps_line(st, 100.0), "GPS RTK FIX\n50.123457 -30.123457")
+
+    def test_hdop_rating_line(self):
+        for eph, text in ((50, "HDOP Excellent (0.5)"), (140, "HDOP Good (1.4)"),
+                          (240, "HDOP Usable (2.4)"), (9999, "HDOP Poor (100.0)")):
+            st = {}
+            vs.apply_mavlink(st, 24, 1, gps_payload(eph=eph), 100.0)
+            self.assertEqual(vs.gps_line(st, 100.0).split("\n")[1], text)
+
+    def test_hdop_rating_boundaries(self):
+        for hdop, rating in ((0.0, "Excellent"), (1.0, "Excellent"), (1.01, "Good"), (2.0, "Good"),
+                             (2.01, "Usable"), (5.0, "Usable"), (5.01, "Poor")):
+            self.assertEqual(vs.hdop_rating(hdop), rating)
+
+    def test_hdop_rating_from_eph_boundaries(self):
+        for eph, rating in ((100, "Excellent"), (200, "Good"), (500, "Usable"), (501, "Poor")):
+            st = {}
+            vs.apply_mavlink(st, 24, 1, gps_payload(eph=eph), 100.0)
+            self.assertIn(rating, vs.gps_line(st, 100.0).split("\n")[1])
+
+    def test_unknown_fix_name(self):
+        st = {}
+        vs.apply_mavlink(st, 24, 1, gps_payload(fix=9, sats=5, eph=65535), 100.0)
+        self.assertTrue(vs.gps_line(st, 100.0).startswith("GPS FIX9 5 sats\n"))
+
+    def test_stale(self):
+        st = {}
+        vs.apply_mavlink(st, 24, 1, gps_payload(), 100.0)
+        self.assertEqual(vs.gps_line(st, 105.0).split("\n")[0], "GPS 3D 12 sats")
+        self.assertEqual(vs.gps_line(st, 105.1), "")
+
+    def test_empty(self):
+        self.assertEqual(vs.gps_line({}, 100.0), "")
+
+    def test_independent_of_sys_status(self):
+        st = {}
+        vs.apply_mavlink(st, 24, 1, gps_payload(), 100.0)
+        self.assertEqual(vs.fc_line(st, 100.0), "")
+
+
+class UptimeTest(unittest.TestCase):
+    def test_format(self):
+        self.assertEqual(vs.format_uptime(0), "UP 0:00:00")
+        self.assertEqual(vs.format_uptime(247.9), "UP 0:04:07")
+        self.assertEqual(vs.format_uptime(13 * 3600), "UP 13:00:00")
+        self.assertEqual(vs.format_uptime(2 * 86400 + 3 * 3600 + 4 * 60 + 5), "UP 2d 03:04:05")
+        self.assertEqual(vs.format_uptime(86400), "UP 1d 00:00:00")
+        self.assertEqual(vs.format_uptime(None), "")
+
+    def test_read(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data="12345.67 4567.89\n")):
+            self.assertEqual(vs.read_uptime(), 12345.67)
+
+    def test_read_missing(self):
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIsNone(vs.read_uptime())
 
 
 if __name__ == "__main__":

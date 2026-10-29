@@ -22,9 +22,11 @@ PI 7.6V 1.2A 68%
 | `CPU %`, `°C` | `/proc/stat`, `thermal_zone0` | Any Pi |
 | `W` | `vcgencmd pmic_read_adc` | **Pi 5 only.** Board rails only — excludes USB devices such as the modem |
 | `UNDERVOLT` / `THROTTLED` | `vcgencmd get_throttled` | Only shown when there's a problem |
+| `UP 0:04:07` / `UP 2d 03:04:05` (top left, below the clock) | `/proc/uptime` | Time since the Pi booted |
 | `fps` | frames reaching the encoder | Per viewer |
 | `FC ...` (bottom left) | MAVLink `SYS_STATUS` / `BATTERY_STATUS` over UDP | Flight controller battery. Hidden if no data for 5 s. See [Battery overlay](#battery-overlay) |
 | `PI ...` (bottom left) | INA226 on I2C | Companion battery, measured before the BEC. Hidden if the sensor is absent. See [Battery overlay](#battery-overlay) |
+| `GPS 3D 12 sats`, `HDOP Good (1.2)`, lat/lon (bottom right) | MAVLink `GPS_RAW_INT` over UDP | FC GPS fix, satellites, HDOP with rating (Excellent <= 1, Good <= 2, Usable <= 5, else Poor); coordinates shown from 2D fix up. Hidden if no data for 5 s |
 | `Lima: ON/OFF` (bottom centre) | Lima status UDP `127.0.0.1:14571` | ON while a GCS is connected to Lima, OFF otherwise (including Lima not installed or stopped). See [Lima](#lima-fake-position-on-the-gcs-map) |
 
 Fields that aren't available on your hardware are hidden. Slow commands (`vcgencmd`, `mmcli`) run every 5 s in a background thread so they never stall the video.
