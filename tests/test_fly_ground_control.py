@@ -84,6 +84,17 @@ class ArbiterTest(unittest.TestCase):
         self.assertTrue(self.feed(seq=2, now=1020, ts=1020))
         self.assertFalse(self.a.resume(1020))
 
+    def test_watchdog_and_disconnect_release_previous_override_once(self):
+        self.assertTrue(self.feed())
+        self.assertTrue(self.a.resume(1000))
+        self.assertEqual(self.a.owner_at(1300), "idle")
+        self.assertEqual(self.a.take_release()[0], 0)
+        self.assertIsNone(self.a.take_release())
+        self.assertTrue(self.feed(seq=2, now=1400, ts=1400))
+        self.assertTrue(self.a.resume(1400))
+        self.a.disconnect()
+        self.assertEqual(self.a.take_release()[2], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -74,6 +74,7 @@ class Arbiter:
             self.owner = "idle"
         elif self.owner == "browser" and not self._fresh(now_ms):
             self.owner = "idle"
+            self.release_pending = True
         return self.owner
 
     def _fresh(self, now_ms):
@@ -107,9 +108,10 @@ class Arbiter:
         return tuple(values)
 
     def disconnect(self):
+        was_browser = self.owner == "browser"
         self.peer_connected = False
         self.owner = "idle"
         self.last_seq = None
         self.last_packet_ms = None
         self.last_channels = None
-        self.release_pending = False
+        self.release_pending = self.release_pending or was_browser
