@@ -1,0 +1,24 @@
+[Unit]
+Description=Fly-by-WebRTC Raspberry Pi Ground bridge
+Wants=network-online.target
+After=network-online.target rpanion-server.service
+Requires=rpanion-server.service
+
+[Service]
+Type=simple
+User=rpanion
+EnvironmentFile=/etc/fly-ground.env
+Environment=PYTHONNOUSERSITE=1
+Environment=XDG_CACHE_HOME=/var/cache/fly-ground
+ExecStart=/opt/fly-ground/venv/bin/python /opt/fly-ground/python/fly_ground.py
+CacheDirectory=fly-ground
+CacheDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

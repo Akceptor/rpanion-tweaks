@@ -463,3 +463,76 @@ The Pi has no battery-backed clock — time is correct only after NTP sync. If t
 ## License
 
 Based on Rpanion Server by Stephen Dade, licensed under GPL-3.0. This modified file is distributed under the same license — see [LICENSE](LICENSE).
+
+# Fly-by-WebRTC Pi Ground bridge
+
+The `fly-ground` service hosts a browser cockpit session for this Pi. It reads Rpanion's H.264 RTSP feed, sends the same image (including any Rpanion HUD burned into it) over WebRTC, and sends selected browser RC channels to ArduPilot as MAVLink overrides. Mission Planner has priority when its GCS heartbeat is visible on the local mavlink-router monitor. The browser cockpit is served by the fly-by-webrtc site; the Pi service has no separate web UI.
+
+## Install (after the Pi is online)
+
+Check the actual RTSP URL in Rpanion's Video page. Enable its Timestamp overlay and choose an overlay-supported raw camera source if the HUD is required. This bridge supports H.264; configure Rpanion to encode H.264, then verify locally:
+
+```sh
+gst-discoverer-1.0 'rtsp://127.0.0.1:8554/video'
+gst-launch-1.0 rtspsrc location='rtsp://127.0.0.1:8554/video' protocols=tcp latency=0 ! rtph264depay ! h264parse ! fakesink
+gst-inspect-1.0 webrtcbin
+gst-inspect-1.0 nice
+gst-inspect-1.0 rtph264pay
+```
+
+Install the OS bindings and a virtual environment that can see them:
+
+```sh
+sudo apt update
+sudo apt install python3-gi python3-venv gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-nice gstreamer1.0-libav
+sudo mkdir -p /opt/fly-ground
+sudo cp -a python /opt/fly-ground/
+sudo python3 -m venv --system-site-packages /opt/fly-ground/venv
+umask 022
+sudo /opt/fly-ground/venv/bin/pip install 'pymavlink==2.4.50' 'websockets==15.0.1'
+sudo chmod -R a+rX /opt/fly-ground/venv/lib/python*/site-packages
+sudo -u rpanion env PYTHONNOUSERSITE=1 /opt/fly-ground/venv/bin/python -c 'import gi, websockets; from pymavlink.dialects.v20 import ardupilotmega; print("ok")'
+```
+
+Run those commands from this repository's root. TURN is optional: the Pi and browser use Cloudflare STUN when `/turn` is unavailable. STUN-only sessions depend on a direct WebRTC path and may fail across LTE or restrictive NAT. For reliable internet sessions, configure Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN`; the Pi fetches short-lived credentials from `/turn`, never the long-lived key.
+
+Create one room code and a private environment file. Replace `https://YOUR-SITE` with the actual fly-by-webrtc origin and set the real RTSP URL if different. The command prints the bookmark once; keep it private because the code allows video viewing.
+
+```sh
+umask 077
+SITE='https://YOUR-SITE' python3 - <<'PY'
+import os, secrets
+alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+groups = [''.join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)]
+code = 'CRAWLER-' + '-'.join(groups)
+site = os.environ['SITE'].rstrip('/')
+with open('/tmp/fly-ground.env', 'w') as f:
+    f.write(f'FLY_ROOM_CODE={code}\nFLY_SITE_URL={site}\n')
+print(f'{site}/#join={code}')
+PY
+sudo install -o rpanion -g rpanion -m 0600 /tmp/fly-ground.env /etc/fly-ground.env
+rm /tmp/fly-ground.env
+```
+
+Set `FLY_RTSP_URL=rtsp://...` if needed. Defaults: `FLY_MAVLINK=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. Set `FLY_SESSION_SECONDS=0` only for an intentional unlimited session. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
+
+Install and start the unit:
+
+```sh
+sudo install -m 0644 systemd/fly-ground.service /etc/systemd/system/fly-ground.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fly-ground
+systemctl status fly-ground
+journalctl -u fly-ground -f
+```
+
+The service logs errors without logging the room code. The code belongs only in `/etc/fly-ground.env` and the private bookmark.
+
+## Vehicle acceptance checks
+
+These checks require the Pi and crawler; they could not run while the Pi was offline during implementation.
+
+1. With wheels off the ground, verify the Rpanion RTSP image in a local player and the browser cockpit. Compare a changing HUD field such as clock or FC battery. Verify H.264 negotiation, data channels, image delay, and Pi CPU over a 15-minute session.
+2. Connect Mission Planner to UDP 14550, then separately to Lima UDP 14551. On each, confirm its GCS heartbeat (normally `255/190`) appears on a read-only `tcp:127.0.0.1:5760` pymavlink monitor. If either route is invisible, do not rely on automatic priority until router routing is corrected. UDP 14571 is Lima status, not a MAVLink input for this bridge.
+3. Browser alone: press Resume driving with neutral throttle and test only configured channels. Close the browser; confirm overrides release and no old command is replayed. Connect Mission Planner through each UDP port and verify immediate browser pause and one override release. Disconnect Planner; the browser must remain paused until a new Resume.
+4. Restart Rpanion and the bridge, repeat the neutral/resume check, and test over the actual internet/LTE path. If TURN is configured, verify a relay candidate in browser WebRTC stats when direct ICE fails. Record latency, CPU, and any codec issue here after the Pi test.
