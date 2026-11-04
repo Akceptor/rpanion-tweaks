@@ -37,6 +37,10 @@ def answer_media_summary(sdp):
     return " | ".join(line.strip() for line in sdp.splitlines() if line.startswith(keep))
 
 
+PONG_WINDOW = 6
+CLOCK_SAMPLES = 10
+
+
 class PeerProtocol:
     def __init__(self, arbiter, send, session_seconds=3600):
         self.arbiter = arbiter
@@ -45,6 +49,10 @@ class PeerProtocol:
         self.started_ms = None
         self.offset_ms = None
         self.ping_id = 0
+        self.sent_pings = {}
+        self.clock_samples = []
+        self.accepted = 0
+        self.rejected = 0
         self.last_owner = None
         self.ended = False
 
@@ -66,29 +74,47 @@ class PeerProtocol:
 
     def ping(self, now_ms):
         self.ping_id += 1
+        self.sent_pings[self.ping_id] = now_ms
+        self.sent_pings.pop(self.ping_id - PONG_WINDOW, None)
         self.send({"t": "ping", "id": self.ping_id, "t0": now_ms})
 
     def control(self, data, now_ms):
         if self.ended:
             return False
-        return self.arbiter.accept_packet(data, now_ms, self.offset_ms)
+        ok = self.arbiter.accept_packet(data, now_ms, self.offset_ms)
+        if ok:
+            self.accepted += 1
+        else:
+            self.rejected += 1
+        return ok
 
     def message(self, value, now_ms):
         if not isinstance(value, dict) or self.ended:
             return False
-        if value.get("t") == "pong" and value.get("id") == self.ping_id:
-            t0, tp = value.get("t0"), value.get("tp")
-            if isinstance(t0, (int, float)) and isinstance(tp, (int, float)) and t0 <= now_ms:
-                self.offset_ms = tp - (t0 + now_ms) / 2
-                return True
+        if value.get("t") == "pong":
+            return self.pong(value, now_ms)
         if value.get("t") == "resume":
             granted = self.arbiter.resume(now_ms)
+            a = self.arbiter
+            throttle = a.last_channels[a.throttle_channel - 1] if a.last_channels else None
+            LOG.info("Resume %s (owner %s, fresh %s, throttle %s, neutral 928-1056)",
+                     "granted" if granted else "refused", a.owner_at(now_ms), a._fresh(now_ms), throttle)
             self.state(now_ms)
             return granted
         if value.get("t") == "leave":
             self.close(now_ms)
             return True
         return False
+
+    def pong(self, value, now_ms):
+        # Pings go out every 500 ms; on a loaded LTE link RTT exceeds that, so a pong can only
+        # match an earlier ping. Keep the lowest-RTT recent sample to resist bufferbloat spikes.
+        t0, tp = self.sent_pings.pop(value.get("id"), None), value.get("tp")
+        if t0 is None or value.get("t0") != t0 or not isinstance(tp, (int, float)) or t0 > now_ms:
+            return False
+        self.clock_samples = (self.clock_samples + [(now_ms - t0, tp - (t0 + now_ms) / 2)])[-CLOCK_SAMPLES:]
+        self.offset_ms = min(self.clock_samples)[1]
+        return True
 
     def tick(self, now_ms):
         if self.ended or self.started_ms is None:

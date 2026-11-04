@@ -64,6 +64,24 @@ class ProtocolTest(unittest.TestCase):
         self.assertAlmostEqual(self.p.offset_ms, 100)
         self.assertTrue(self.p.control(packet(ts=1150), 1050))
 
+    def test_late_pong_for_earlier_ping_still_sets_offset(self):
+        self.p.ping(1000)
+        self.p.ping(1500)
+        self.p.ping(2000)
+        self.assertTrue(self.p.message({"t": "pong", "id": 1, "t0": 1000, "tp": 1400}, 1800))
+        self.assertAlmostEqual(self.p.offset_ms, 1400 - (1000 + 1800) / 2)
+
+    def test_offset_uses_lowest_rtt_sample_and_rejects_forged_pongs(self):
+        self.p.ping(1000)
+        self.p.ping(1500)
+        self.assertTrue(self.p.message({"t": "pong", "id": 1, "t0": 1000, "tp": 1900}, 1700))
+        self.assertTrue(self.p.message({"t": "pong", "id": 2, "t0": 1500, "tp": 1600}, 1520))
+        self.assertAlmostEqual(self.p.offset_ms, 1600 - (1500 + 1520) / 2)
+        self.assertFalse(self.p.message({"t": "pong", "id": 2, "t0": 1500, "tp": 1}, 1530))
+        self.assertFalse(self.p.message({"t": "pong", "id": 9, "t0": 1500, "tp": 1}, 1530))
+        self.p.ping(2000)
+        self.assertFalse(self.p.message({"t": "pong", "id": 3, "t0": 1999, "tp": 1}, 2010))
+
     def test_unknown_commands_and_session_expiry(self):
         self.assertFalse(self.p.message({"t": "arm"}, 1000))
         self.p.tick(3_601_001)

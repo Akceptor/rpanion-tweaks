@@ -72,6 +72,15 @@ def telemetry_message(msg):
     return {"t": "telemetry", "kind": msg.get_type(), "fields": fields}
 
 
+def log_status(protocol, arbiter, adapter, now):
+    planner = arbiter.last_planner_ms
+    LOG.info("Control: owner=%s target=%s packets ok=%d bad=%d %s last_age=%s offset=%s planner_seen=%s",
+             arbiter.owner_at(now), adapter.target, protocol.accepted, protocol.rejected,
+             arbiter.rejects, arbiter.last_age_ms,
+             "set" if protocol.offset_ms is not None else "none",
+             "never" if planner is None else f"{(now - planner) / 1000:.1f}s ago")
+
+
 async def run_session(settings):
     import websockets
     from gi.repository import GLib
@@ -105,7 +114,7 @@ async def run_session(settings):
     try:
         async with websockets.connect(signal_url(settings), max_size=65536, open_timeout=15) as ws:
             peer = GstPeer(settings.rtsp_url, servers, queue_signal, protocol, on_closed)
-            last_ping = last_state = now_ms()
+            last_ping = last_state = last_status = now_ms()
             signal_open = True
             connecting_at = None
             context = GLib.MainContext.default()
@@ -119,6 +128,9 @@ async def run_session(settings):
                 adapter.poll(now)
                 protocol.tick(now)
                 adapter.send(now)
+                if protocol.started_ms is not None and now - last_status >= 5000:
+                    last_status = now
+                    log_status(protocol, arbiter, adapter, now)
                 if protocol.started_ms is not None and now - last_ping >= 500:
                     protocol.ping(now)
                     last_ping = now

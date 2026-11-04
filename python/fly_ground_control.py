@@ -45,15 +45,24 @@ class Arbiter:
         self.last_channels = None
         self.last_planner_ms = None
         self.release_pending = False
+        self.rejects = {"decode": 0, "offset": 0, "seq": 0, "age": 0}
+        self.last_age_ms = None
 
     def accept_packet(self, data, now_ms, offset_ms):
         pkt = decode_packet(data)
-        if pkt is None or offset_ms is None:
+        if pkt is None:
+            self.rejects["decode"] += 1
+            return False
+        if offset_ms is None:
+            self.rejects["offset"] += 1
             return False
         if self.last_seq is not None and pkt.seq <= self.last_seq:
+            self.rejects["seq"] += 1
             return False
         age = now_ms - (pkt.ts - offset_ms)
+        self.last_age_ms = age
         if age > 200 or age < -200:
+            self.rejects["age"] += 1
             return False
         self.last_seq = pkt.seq
         self.last_packet_ms = now_ms
