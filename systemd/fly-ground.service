@@ -8,6 +8,7 @@ Requires=rpanion-server.service
 Type=simple
 User=rpanion
 EnvironmentFile=/etc/fly-ground.env
+Environment=PYTHONNOUSERSITE=1
 ExecStart=/opt/fly-ground/venv/bin/python /opt/fly-ground/python/fly_ground.py
 Restart=on-failure
 RestartSec=5

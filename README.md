@@ -488,7 +488,7 @@ sudo mkdir -p /opt/fly-ground
 sudo cp -a python /opt/fly-ground/
 sudo python3 -m venv --system-site-packages /opt/fly-ground/venv
 sudo /opt/fly-ground/venv/bin/pip install 'pymavlink==2.4.50' 'websockets==15.0.1'
-sudo -u rpanion /opt/fly-ground/venv/bin/python -c 'import gi, websockets; from pymavlink import mavutil; print("ok")'
+sudo -u rpanion env PYTHONNOUSERSITE=1 /opt/fly-ground/venv/bin/python -c 'import gi, websockets; from pymavlink.dialects.v20 import ardupilotmega; print("ok")'
 ```
 
 Run those commands from this repository's root. TURN is optional: the Pi and browser use Cloudflare STUN when `/turn` is unavailable. STUN-only sessions depend on a direct WebRTC path and may fail across LTE or restrictive NAT. For reliable internet sessions, configure Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN`; the Pi fetches short-lived credentials from `/turn`, never the long-lived key.
