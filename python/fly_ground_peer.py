@@ -32,6 +32,11 @@ def require_webrtc_plugins(gst):
         raise RuntimeError("GStreamer ICE plugin missing: install gstreamer1.0-nice")
 
 
+def answer_media_summary(sdp):
+    keep = ("m=", "a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive", "a=rtpmap:", "a=fmtp:")
+    return " | ".join(line.strip() for line in sdp.splitlines() if line.startswith(keep))
+
+
 class PeerProtocol:
     def __init__(self, arbiter, send, session_seconds=3600):
         self.arbiter = arbiter
@@ -122,10 +127,13 @@ class GstPeer:
         self.loop = asyncio.get_running_loop()
         self.Gst, self.GstSdp, self.GstWebRTC = Gst, GstSdp, GstWebRTC
         self.signal, self.protocol, self.on_closed = signal, protocol, on_closed
+        # One keyframe is dozens of RTP packets with one timestamp: a buffer-count limit on this
+        # leaky queue drops part of every frame, so it is bounded by time instead.
         self.pipeline = Gst.parse_launch(
             "webrtcbin name=webrtc bundle-policy=max-bundle "
-            "rtspsrc name=source protocols=tcp latency=0 ! rtph264depay ! h264parse "
-            "! rtph264pay config-interval=1 pt=96 ! queue max-size-buffers=4 leaky=downstream "
+            "rtspsrc name=source protocols=tcp latency=0 ! rtph264depay name=depay ! h264parse "
+            "! rtph264pay name=pay config-interval=1 pt=96 "
+            "! queue name=q max-size-buffers=0 max-size-bytes=0 max-size-time=300000000 leaky=downstream "
             f"! {VIDEO_CAPS} ! webrtc.")
         self.pipeline.get_by_name("source").set_property("location", rtsp_url)
         self.webrtc = self.pipeline.get_by_name("webrtc")
@@ -152,6 +160,10 @@ class GstPeer:
         self.control.connect("on-message-data", self._control)
         self.session.connect("on-message-string", self._message)
         self.session.connect("on-open", self._opened)
+        self.counts = {}
+        self.counts_logged_ms = 0
+        for name, pad in (("depay", "src"), ("pay", "src"), ("q", "src")):
+            self._count(self.pipeline.get_by_name(name).get_static_pad(pad), name)
         self.bus = self.pipeline.get_bus()
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -220,17 +232,55 @@ class GstPeer:
             if result != self.GstSdp.SDPResult.OK or self.GstSdp.sdp_message_parse_buffer(msg["sdp"].encode(), sdp) != self.GstSdp.SDPResult.OK:
                 raise ValueError("invalid SDP answer")
             answer = self.GstWebRTC.WebRTCSessionDescription.new(self.GstWebRTC.WebRTCSDPType.ANSWER, sdp)
-            self.webrtc.emit("set-remote-description", answer, self.Gst.Promise.new())
+            LOG.info("Answer media: %s", answer_media_summary(msg["sdp"]))
+            promise = self.Gst.Promise.new_with_change_func(self._remote_set)
+            self.webrtc.emit("set-remote-description", answer, promise)
         elif msg.get("type") == "ice":
             candidate = msg.get("candidate", {})
             if isinstance(candidate.get("candidate"), str) and isinstance(candidate.get("sdpMLineIndex"), int):
                 self.webrtc.emit("add-ice-candidate", candidate["sdpMLineIndex"], candidate["candidate"])
 
+    def _count(self, pad, name):
+        self.counts[name] = 0
+
+        def probe(_pad, _info):
+            self.counts[name] += 1
+            return self.Gst.PadProbeReturn.OK
+        pad.add_probe(self.Gst.PadProbeType.BUFFER, probe)
+
+    def log_counts(self, now_ms):
+        if now_ms - self.counts_logged_ms < 5000 or not LOG.isEnabledFor(logging.DEBUG):
+            return
+        self.counts_logged_ms = now_ms
+        caps = self.pipeline.get_by_name("pay").get_static_pad("src").get_current_caps()
+        LOG.debug("Buffers %s; pay caps %s", self.counts,
+                 caps.to_string()[:300] if caps is not None else None)
+
+    def _remote_set(self, promise, *_user_data):
+        reply = promise.get_reply()
+        if reply is not None and reply.has_field("error"):
+            LOG.error("set-remote-description failed: %s", reply.get_value("error").message)
+        else:
+            LOG.info("Remote description applied")
+
     def poll_bus(self):
+        Gst = self.Gst
+        self.log_counts(self.now())
         while True:
-            msg = self.bus.timed_pop_filtered(0, self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS)
+            msg = self.bus.timed_pop_filtered(
+                0, Gst.MessageType.ERROR | Gst.MessageType.EOS | Gst.MessageType.WARNING
+                | Gst.MessageType.STATE_CHANGED)
             if msg is None:
                 break
+            if msg.type == Gst.MessageType.WARNING:
+                warning, debug = msg.parse_warning()
+                LOG.warning("GStreamer %s: %s (%s)", msg.src.get_name(), warning.message, debug)
+                continue
+            if msg.type == Gst.MessageType.STATE_CHANGED:
+                if msg.src == self.pipeline:
+                    _old, new, _pending = msg.parse_state_changed()
+                    LOG.info("Pipeline: %s", new.value_nick)
+                continue
             if msg.type == self.Gst.MessageType.ERROR:
                 error, _debug = msg.parse_error()
                 raise RuntimeError(f"GStreamer: {error.message}")
