@@ -1,7 +1,11 @@
 """Signaling and session protocol for the Pi's GStreamer WebRTC peer."""
 
 import json
+import logging
 from urllib.parse import quote, urlsplit
+
+
+LOG = logging.getLogger("fly-ground")
 
 
 def signal_url(settings):
@@ -21,6 +25,11 @@ def turn_uris(servers):
                 port = f":{parsed.port}" if parsed.port else ""
                 result.append(f"{parsed.scheme}://{user}:{password}@{parsed.hostname}{port}")
     return result
+
+
+def require_webrtc_plugins(gst):
+    if not all(gst.ElementFactory.find(name) for name in ("nicesrc", "nicesink")):
+        raise RuntimeError("GStreamer ICE plugin missing: install gstreamer1.0-nice")
 
 
 class PeerProtocol:
@@ -94,6 +103,9 @@ class PeerProtocol:
                 self.state(now_ms)
 
 
+VIDEO_CAPS = "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
+
+
 class GstPeer:
     """One GStreamer peer; all methods run on the GLib/asyncio main thread."""
 
@@ -106,6 +118,7 @@ class GstPeer:
         from gi.repository import Gst, GstSdp, GstWebRTC
 
         Gst.init(None)
+        require_webrtc_plugins(Gst)
         self.loop = asyncio.get_running_loop()
         self.Gst, self.GstSdp, self.GstWebRTC = Gst, GstSdp, GstWebRTC
         self.signal, self.protocol, self.on_closed = signal, protocol, on_closed
@@ -113,16 +126,29 @@ class GstPeer:
             "webrtcbin name=webrtc bundle-policy=max-bundle "
             "rtspsrc name=source protocols=tcp latency=0 ! rtph264depay ! h264parse "
             "! rtph264pay config-interval=1 pt=96 ! queue max-size-buffers=4 leaky=downstream "
-            "! application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! webrtc.")
+            f"! {VIDEO_CAPS} ! webrtc.")
         self.pipeline.get_by_name("source").set_property("location", rtsp_url)
         self.webrtc = self.pipeline.get_by_name("webrtc")
         self.webrtc.set_property("stun-server", "stun://stun.cloudflare.com:3478")
         for uri in turn_uris(ice_servers):
             self.webrtc.emit("add-turn-server", uri)
+        # Without codec-preferences, create-offer fails until RTSP caps reach webrtcbin.
+        video = self.webrtc.emit("get-transceiver", 0)
+        if video is None:
+            raise RuntimeError("webrtcbin has no video transceiver")
+        video.set_property("direction", GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
+        video.set_property("codec-preferences", Gst.Caps.from_string(VIDEO_CAPS))
         self.webrtc.connect("on-ice-candidate", self._ice)
         self.webrtc.connect("notify::connection-state", self._connection)
+        self.webrtc.connect("notify::ice-connection-state", self._ice_state)
+        # webrtcbin refuses create-data-channel until NULL->READY starts its internal thread.
+        if self.pipeline.set_state(Gst.State.READY) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("GStreamer pipeline failed to reach READY")
         self.control = self.webrtc.emit("create-data-channel", "control", self._control_config())
         self.session = self.webrtc.emit("create-data-channel", "session", None)
+        if self.control is None or self.session is None:
+            self.pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("webrtcbin did not create data channels")
         self.control.connect("on-message-data", self._control)
         self.session.connect("on-message-string", self._message)
         self.session.connect("on-open", self._opened)
@@ -136,6 +162,7 @@ class GstPeer:
         return config
 
     def _opened(self, _channel):
+        LOG.info("Session channel open")
         self.loop.call_soon_threadsafe(self.protocol.open, self.now())
 
     @staticmethod
@@ -161,20 +188,31 @@ class GstPeer:
     def _ice(self, _webrtc, index, candidate):
         self.signal({"type": "ice", "candidate": {"candidate": candidate, "sdpMLineIndex": index}})
 
+    def _ice_state(self, peer, _pspec):
+        LOG.info("ICE: %s", peer.get_property("ice-connection-state").value_nick)
+
     def _connection(self, peer, _pspec):
         state = peer.get_property("connection-state")
+        LOG.info("WebRTC: %s", state.value_nick)
         if state in (self.GstWebRTC.WebRTCPeerConnectionState.FAILED,
                      self.GstWebRTC.WebRTCPeerConnectionState.CLOSED):
             self.loop.call_soon_threadsafe(self.on_closed)
 
     def offer(self):
-        promise = self.Gst.Promise.new_with_change_func(self._offer_ready, None, None)
+        promise = self.Gst.Promise.new_with_change_func(self._offer_ready)
         self.webrtc.emit("create-offer", None, promise)
 
-    def _offer_ready(self, promise, _data):
-        offer = promise.get_reply().get_value("offer")
+    def _offer_ready(self, promise, *_user_data):
+        reply = promise.get_reply()
+        offer = reply.get_value("offer") if reply is not None and reply.has_field("offer") else None
+        if offer is None or offer.sdp is None:
+            error = reply.get_value("error") if reply is not None and reply.has_field("error") else None
+            LOG.error("create-offer failed: %s", error.message if error is not None else reply)
+            self.loop.call_soon_threadsafe(self.on_closed)
+            return
         self.webrtc.emit("set-local-description", offer, self.Gst.Promise.new())
         self.signal({"type": "offer", "sdp": offer.sdp.as_text()})
+        LOG.info("Offer sent")
 
     def on_signal(self, msg):
         if msg.get("type") == "answer":

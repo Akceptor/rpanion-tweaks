@@ -6,11 +6,18 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from fly_ground_control import Arbiter
-from fly_ground_peer import PeerProtocol, signal_url, turn_uris
+from fly_ground_peer import PeerProtocol, require_webrtc_plugins, signal_url, turn_uris
 from test_fly_ground_control import packet
 
 
 class SignalTest(unittest.TestCase):
+    def test_missing_nice_plugin_has_install_hint(self):
+        gst = SimpleNamespace(ElementFactory=SimpleNamespace(find=lambda name: object() if name == "nicesrc" else None))
+        with self.assertRaisesRegex(RuntimeError, "gstreamer1.0-nice"):
+            require_webrtc_plugins(gst)
+        gst.ElementFactory.find = lambda name: object()
+        require_webrtc_plugins(gst)
+
     def test_host_url_uses_hashed_room_only(self):
         s = SimpleNamespace(site_url="https://site.example", room_id="a" * 64, code="SECRET")
         self.assertEqual(signal_url(s), "wss://site.example/room/" + "a" * 64 + "?role=host")

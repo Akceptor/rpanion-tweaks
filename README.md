@@ -476,6 +476,7 @@ Check the actual RTSP URL in Rpanion's Video page. Enable its Timestamp overlay 
 gst-discoverer-1.0 'rtsp://127.0.0.1:8554/video'
 gst-launch-1.0 rtspsrc location='rtsp://127.0.0.1:8554/video' protocols=tcp latency=0 ! rtph264depay ! h264parse ! fakesink
 gst-inspect-1.0 webrtcbin
+gst-inspect-1.0 nice
 gst-inspect-1.0 rtph264pay
 ```
 
@@ -483,7 +484,7 @@ Install the OS bindings and a virtual environment that can see them:
 
 ```sh
 sudo apt update
-sudo apt install python3-gi python3-venv gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+sudo apt install python3-gi python3-venv gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-nice gstreamer1.0-libav
 sudo mkdir -p /opt/fly-ground
 sudo cp -a python /opt/fly-ground/
 sudo python3 -m venv --system-site-packages /opt/fly-ground/venv

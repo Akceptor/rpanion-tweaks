@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from urllib.request import Request, urlopen
 
@@ -16,6 +17,22 @@ from fly_ground_peer import GstPeer, PeerProtocol, signal_url
 
 LOG = logging.getLogger("fly-ground")
 STUN_FALLBACK = [{"urls": "stun:stun.cloudflare.com:3478"}]
+# Worker close codes: host already present, room locked/closed, join rate limit.
+ROOM_REJECT_CODES = {4001, 4009, 4029}
+REJECT_DELAY = 30
+
+
+class RoomRejected(ConnectionError):
+    def __init__(self, code):
+        super().__init__(f"signaling server rejected host (close code {code})")
+        self.code = code
+
+
+def next_delay(delay, exc):
+    # Each rejected join counts toward the worker's per-IP limiter, so back off hard.
+    if isinstance(exc, RoomRejected):
+        return REJECT_DELAY, 1
+    return delay, min(delay * 2, 30)
 
 
 def now_ms():
@@ -90,7 +107,7 @@ async def run_session(settings):
             peer = GstPeer(settings.rtsp_url, servers, queue_signal, protocol, on_closed)
             last_ping = last_state = now_ms()
             signal_open = True
-            connecting_at = now_ms()
+            connecting_at = None
             context = GLib.MainContext.default()
             while not closed and not protocol.ended:
                 now = now_ms()
@@ -114,21 +131,29 @@ async def run_session(settings):
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=.02)
                         msg = json.loads(raw)
+                        if msg.get("type") != "ice":
+                            LOG.info("Signal: %s", msg.get("type"))
                         if msg.get("type") == "peer-joined":
+                            connecting_at = now_ms()
                             peer.offer()
                         else:
                             peer.on_signal(msg)
                     except asyncio.TimeoutError:
                         pass
-                    except websockets.ConnectionClosed:
+                    except websockets.ConnectionClosed as exc:
+                        code = getattr(exc.rcvd, "code", None)
+                        LOG.info("Signaling closed: %s %s", code, getattr(exc.rcvd, "reason", ""))
                         signal_open = False
+                        if connecting_at is None and code in ROOM_REJECT_CODES:
+                            raise RoomRejected(code) from None
                     except (ValueError, TypeError, KeyError) as exc:
                         LOG.warning("Invalid signaling message: %s", type(exc).__name__)
                 else:
                     await asyncio.sleep(.02)
-                if protocol.started_ms is None and now - connecting_at > 60_000:
+                if protocol.started_ms is None and connecting_at is not None and now - connecting_at > 60_000:
                     raise TimeoutError("WebRTC peer did not connect")
-                if not signal_open and protocol.started_ms is None:
+                # The browser drops signaling once ICE connects, which can precede the data channel opening.
+                if not signal_open and protocol.started_ms is None and connecting_at is None:
                     raise ConnectionError("signaling closed before WebRTC connected")
     finally:
         protocol.close(now_ms())
@@ -147,19 +172,33 @@ async def run(settings):
     while True:
         try:
             await run_session(settings)
-            delay = 1
+            wait, delay = 1, 1
         except asyncio.CancelledError:
             raise
+        except RoomRejected as exc:
+            LOG.warning("%s; retrying in %ss", exc, REJECT_DELAY)
+            wait, delay = next_delay(delay, exc)
         except Exception as exc:
             LOG.exception("Session stopped (%s): %s", type(exc).__name__, exc)
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 30)
+            wait, delay = next_delay(delay, exc)
+        await asyncio.sleep(wait)
+
+
+async def serve(settings):
+    # systemd stops with SIGTERM; cancelling lets run_session's finally release RC overrides
+    # and close the websocket, so the worker does not keep a stale host socket.
+    task = asyncio.current_task()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        await run(settings)
+    except asyncio.CancelledError:
+        LOG.info("Stopped")
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     settings = Settings.from_env(os.environ)
-    asyncio.run(run(settings))
+    asyncio.run(serve(settings))
 
 
 if __name__ == "__main__":
