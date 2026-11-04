@@ -483,11 +483,13 @@ Install the OS bindings and a virtual environment that can see them:
 
 ```sh
 sudo apt update
-sudo apt install python3-gi python3-venv gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+sudo apt install python3-gi python3-venv gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 sudo mkdir -p /opt/fly-ground
 sudo cp -a python /opt/fly-ground/
 sudo python3 -m venv --system-site-packages /opt/fly-ground/venv
+umask 022
 sudo /opt/fly-ground/venv/bin/pip install 'pymavlink==2.4.50' 'websockets==15.0.1'
+sudo chmod -R a+rX /opt/fly-ground/venv/lib/python*/site-packages
 sudo -u rpanion env PYTHONNOUSERSITE=1 /opt/fly-ground/venv/bin/python -c 'import gi, websockets; from pymavlink.dialects.v20 import ardupilotmega; print("ok")'
 ```
 
