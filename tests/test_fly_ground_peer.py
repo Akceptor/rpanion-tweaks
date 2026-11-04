@@ -101,3 +101,15 @@ class ProtocolTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StallTest(unittest.TestCase):
+    def test_rtsp_stall_raises_after_five_silent_seconds(self):
+        from fly_ground_peer import GstPeer
+        peer = SimpleNamespace(counts={"depay": 0}, stall_check=(None, None))
+        GstPeer.check_stall(peer, 0)
+        peer.counts["depay"] = 10
+        GstPeer.check_stall(peer, 4000)
+        GstPeer.check_stall(peer, 9000)
+        with self.assertRaisesRegex(RuntimeError, "RTSP stalled"):
+            GstPeer.check_stall(peer, 9001)

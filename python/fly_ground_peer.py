@@ -134,6 +134,7 @@ class PeerProtocol:
                 self.state(now_ms)
 
 
+RTSP_STALL_MS = 5000
 VIDEO_CAPS = "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
 
 
@@ -188,6 +189,7 @@ class GstPeer:
         self.session.connect("on-open", self._opened)
         self.counts = {}
         self.counts_logged_ms = 0
+        self.stall_check = (None, None)
         for name, pad in (("depay", "src"), ("pay", "src"), ("q", "src")):
             self._count(self.pipeline.get_by_name(name).get_static_pad(pad), name)
         self.bus = self.pipeline.get_bus()
@@ -289,9 +291,18 @@ class GstPeer:
         else:
             LOG.info("Remote description applied")
 
+    def check_stall(self, now_ms):
+        # Rpanion restarting its stream leaves rtspsrc connected but silent, with only a warning.
+        count, since = self.stall_check
+        if count != self.counts["depay"] or since is None:
+            self.stall_check = (self.counts["depay"], now_ms)
+        elif now_ms - since > RTSP_STALL_MS:
+            raise RuntimeError(f"RTSP stalled: no video for {RTSP_STALL_MS // 1000}s")
+
     def poll_bus(self):
         Gst = self.Gst
         self.log_counts(self.now())
+        self.check_stall(self.now())
         while True:
             msg = self.bus.timed_pop_filtered(
                 0, Gst.MessageType.ERROR | Gst.MessageType.EOS | Gst.MessageType.WARNING
