@@ -491,7 +491,7 @@ sudo /opt/fly-ground/venv/bin/pip install 'pymavlink==2.4.50' 'websockets==15.0.
 sudo -u rpanion /opt/fly-ground/venv/bin/python -c 'import gi, websockets; from pymavlink import mavutil; print("ok")'
 ```
 
-Run those commands from this repository's root. Configure Cloudflare Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN` on the fly-by-webrtc deployment first; `/turn` must return short-lived ICE servers. The Pi fetches those credentials, never the long-lived key.
+Run those commands from this repository's root. TURN is optional: the Pi and browser use Cloudflare STUN when `/turn` is unavailable. STUN-only sessions depend on a direct WebRTC path and may fail across LTE or restrictive NAT. For reliable internet sessions, configure Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN`; the Pi fetches short-lived credentials from `/turn`, never the long-lived key.
 
 Create one room code and a private environment file. Replace `https://YOUR-SITE` with the actual fly-by-webrtc origin and set the real RTSP URL if different. The command prints the bookmark once; keep it private because the code allows video viewing.
 
@@ -532,4 +532,4 @@ These checks require the Pi and crawler; they could not run while the Pi was off
 1. With wheels off the ground, verify the Rpanion RTSP image in a local player and the browser cockpit. Compare a changing HUD field such as clock or FC battery. Verify H.264 negotiation, data channels, image delay, and Pi CPU over a 15-minute session.
 2. Connect Mission Planner to UDP 14550, then separately to Lima UDP 14551. On each, confirm its GCS heartbeat (normally `255/190`) appears on a read-only `tcp:127.0.0.1:5760` pymavlink monitor. If either route is invisible, do not rely on automatic priority until router routing is corrected. UDP 14571 is Lima status, not a MAVLink input for this bridge.
 3. Browser alone: press Resume driving with neutral throttle and test only configured channels. Close the browser; confirm overrides release and no old command is replayed. Connect Mission Planner through each UDP port and verify immediate browser pause and one override release. Disconnect Planner; the browser must remain paused until a new Resume.
-4. Restart Rpanion and the bridge, repeat the neutral/resume check, and test over the actual internet/LTE path. In browser WebRTC stats, verify a relay candidate when direct ICE fails. Record latency, CPU, and any codec issue here after the Pi test.
+4. Restart Rpanion and the bridge, repeat the neutral/resume check, and test over the actual internet/LTE path. If TURN is configured, verify a relay candidate in browser WebRTC stats when direct ICE fails. Record latency, CPU, and any codec issue here after the Pi test.

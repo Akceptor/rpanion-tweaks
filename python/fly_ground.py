@@ -15,6 +15,7 @@ from fly_ground_peer import GstPeer, PeerProtocol, signal_url
 
 
 LOG = logging.getLogger("fly-ground")
+STUN_FALLBACK = [{"urls": "stun:stun.cloudflare.com:3478"}]
 
 
 def now_ms():
@@ -22,11 +23,17 @@ def now_ms():
 
 
 def ice_servers(site_url):
-    with urlopen(Request(site_url + "/turn", headers={"Accept": "application/json"}), timeout=15) as response:
-        servers = json.load(response)["iceServers"]
-    if not isinstance(servers, list) or not any(server.get("username") for server in servers):
-        raise RuntimeError("TURN credentials unavailable")
-    return servers
+    try:
+        with urlopen(Request(site_url + "/turn", headers={"Accept": "application/json"}), timeout=15) as response:
+            servers = json.load(response)["iceServers"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        LOG.warning("TURN unavailable (%s); using STUN only", type(exc).__name__)
+        return STUN_FALLBACK
+    if isinstance(servers, list) and any(isinstance(server, dict) and server.get("username")
+                                             and server.get("credential") for server in servers):
+        return servers
+    LOG.warning("TURN response has no relay credentials; using STUN only")
+    return STUN_FALLBACK
 
 
 def mavlink_connections(settings):
