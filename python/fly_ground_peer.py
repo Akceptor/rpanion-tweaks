@@ -40,7 +40,7 @@ class PeerProtocol:
         self.state(now_ms)
 
     def remaining(self, now_ms):
-        return None if self.session_seconds == 0 else max(0, self.session_seconds * 1000 - (now_ms - self.started_ms))
+        return None if self.session_seconds == 0 or self.started_ms is None else max(0, self.session_seconds * 1000 - (now_ms - self.started_ms))
 
     def state(self, now_ms):
         owner = self.arbiter.owner_at(now_ms)
@@ -77,7 +77,7 @@ class PeerProtocol:
         return False
 
     def tick(self, now_ms):
-        if self.ended:
+        if self.ended or self.started_ms is None:
             return
         if self.remaining(now_ms) == 0:
             self.close(now_ms)
@@ -90,7 +90,8 @@ class PeerProtocol:
         if not self.ended:
             self.ended = True
             self.arbiter.disconnect()
-            self.state(now_ms)
+            if self.started_ms is not None:
+                self.state(now_ms)
 
 
 class GstPeer:

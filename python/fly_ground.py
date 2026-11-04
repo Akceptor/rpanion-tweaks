@@ -151,7 +151,7 @@ async def run(settings):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            LOG.warning("Session stopped (%s): %s", type(exc).__name__, exc)
+            LOG.exception("Session stopped (%s): %s", type(exc).__name__, exc)
         await asyncio.sleep(delay)
         delay = min(delay * 2, 30)
 

@@ -63,6 +63,16 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(self.sent[-1]["phase"], "ended")
         self.assertEqual(self.arbiter.owner, "idle")
 
+    def test_close_before_channel_opens_has_no_session_state(self):
+        arbiter = Arbiter()
+        sent = []
+        protocol = PeerProtocol(arbiter, sent.append)
+        protocol.tick(999)
+        self.assertEqual(sent, [])
+        protocol.close(1000)
+        self.assertTrue(protocol.ended)
+        self.assertEqual(sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()
