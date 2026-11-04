@@ -110,9 +110,10 @@ class GstPeer:
         self.Gst, self.GstSdp, self.GstWebRTC = Gst, GstSdp, GstWebRTC
         self.signal, self.protocol, self.on_closed = signal, protocol, on_closed
         self.pipeline = Gst.parse_launch(
+            "webrtcbin name=webrtc bundle-policy=max-bundle "
             "rtspsrc name=source protocols=tcp latency=0 ! rtph264depay ! h264parse "
             "! rtph264pay config-interval=1 pt=96 ! queue max-size-buffers=4 leaky=downstream "
-            "! application/x-rtp,media=video,encoding-name=H264,payload=96 ! webrtcbin name=webrtc bundle-policy=max-bundle")
+            "! application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! webrtc.")
         self.pipeline.get_by_name("source").set_property("location", rtsp_url)
         self.webrtc = self.pipeline.get_by_name("webrtc")
         self.webrtc.set_property("stun-server", "stun://stun.cloudflare.com:3478")
