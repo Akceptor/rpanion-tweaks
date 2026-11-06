@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Rover bridge settings</title>
+<style>
+:root{color-scheme:dark;--bg:#10151c;--panel:#18212c;--line:#344252;--text:#edf3f9;--muted:#a8b7c8;--accent:#83caff;--warning:#ffc476;--error:#ff9b9b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}main{max-width:1060px;margin:auto;padding:32px 24px 64px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:24px}h1{font-size:28px;line-height:1.2;margin:5px 0 8px}h2,legend{font-size:17px;font-weight:650;margin:0 0 14px}.eyebrow{color:var(--accent);text-transform:uppercase;font-size:12px;letter-spacing:.14em}.muted,.hint{color:var(--muted)}p{margin:0 0 12px}.badge{border:1px solid var(--line);border-radius:99px;padding:5px 12px;white-space:nowrap;color:var(--muted)}.badge.editing{color:var(--warning);border-color:var(--warning)}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:18px}.row{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.grow{flex:1;min-width:200px}.code{display:block;font:600 22px/1.5 ui-monospace,monospace;letter-spacing:.04em;overflow-wrap:anywhere;user-select:all;margin:5px 0 14px}.link{display:block;overflow-wrap:anywhere;color:var(--accent);margin:6px 0 16px}.hint{font-size:13px;margin:8px 0 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}fieldset{border:0;padding:0;margin:0;min-width:0}legend{padding:0}label.field{display:block;margin:0 0 15px}label.field:last-child{margin-bottom:0}.field>span{display:block;font-size:13px;color:var(--muted);margin-bottom:5px}input{width:100%;border:1px solid var(--line);border-radius:7px;background:#101923;color:var(--text);padding:10px 11px;font:14px/1.4 ui-monospace,monospace}input[readonly]{background:#151e28;border-color:transparent;color:#d6e0eb}input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button{border:1px solid var(--line);border-radius:7px;background:#263445;color:var(--text);padding:9px 14px;font:600 14px/1.4 system-ui;cursor:pointer}button:hover:not(:disabled){border-color:var(--accent)}button.primary{background:var(--accent);color:#102335;border-color:var(--accent)}button:disabled{opacity:.45;cursor:not-allowed}.actions{display:flex;gap:10px;flex-wrap:wrap}.form-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:20px}.form-head h2{margin:0}#status{min-height:24px;margin:0 0 18px;color:var(--muted)}#status.error{color:var(--error)}#status.success{color:var(--accent)}#pending{color:var(--warning);margin:0 0 10px}[hidden]{display:none!important}.restart{margin-top:6px}.restart h2{margin-bottom:5px}@media(max-width:640px){main{padding:22px 14px 40px}header{align-items:flex-start}.grid{grid-template-columns:1fr}.card{padding:18px}.form-head{align-items:flex-start;flex-direction:column}.code{font-size:18px}h1{font-size:24px}.badge{font-size:12px}}
+</style>
+</head>
+<body>
+<main>
+<header><div><div class="eyebrow">Raspberry Pi · Fly-by-WebRTC</div><h1>Rover bridge settings</h1><p class="muted">Review the saved configuration, then edit when needed.</p></div><span id="modeBadge" class="badge">Read only</span></header>
+<p id="status" role="status" aria-live="polite">Loading settings…</p>
+<section class="card" aria-labelledby="codeHeading">
+<div class="row"><div class="grow"><h2 id="codeHeading">Connection code</h2><output id="savedCode" class="code">—</output></div><button id="recreate" type="button" disabled>Recreate code</button></div>
+<p class="muted">Recreate generates and saves a new code immediately. Restart the bridge to use it.</p>
+<a id="joinLink" class="link" hidden target="_blank" rel="noopener noreferrer"></a>
+<button id="copyLink" type="button" disabled>Copy connection link</button>
+<p id="recreateHint" class="hint">The running session keeps its current code until the bridge restarts.</p>
+</section>
+<form id="settingsForm" autocomplete="off">
+<section class="card">
+<div class="form-head"><h2>Saved settings</h2><div class="actions"><button id="edit" type="button" disabled>Edit settings</button><button id="save" class="primary" type="submit" hidden disabled>Save changes</button><button id="cancel" type="button" hidden disabled>Cancel</button></div></div>
+<div class="grid">
+<fieldset><legend>Connection &amp; video</legend>
+<label class="field"><span>Connection code</span><input name="FLY_ROOM_CODE" readonly required spellcheck="false" aria-label="Connection code"></label>
+<label class="field"><span>Cockpit site URL</span><input name="FLY_SITE_URL" type="url" readonly required spellcheck="false"></label>
+<label class="field"><span>Camera RTSP URL</span><input name="FLY_RTSP_URL" type="url" readonly required spellcheck="false"></label>
+<label class="field"><span>MAVLink router connection</span><input name="FLY_MAVLINK" readonly required spellcheck="false"></label>
+<label class="field"><span>Session limit (seconds; 0 = unlimited)</span><input name="FLY_SESSION_SECONDS" type="number" min="0" max="86400" step="1" readonly required></label>
+</fieldset>
+<fieldset><legend>Control channels</legend>
+<label class="field"><span>Allowed override channels (comma-separated)</span><input name="FLY_CHANNELS" readonly required spellcheck="false"></label>
+<label class="field"><span>Throttle channel</span><input name="FLY_THROTTLE_CHANNEL" type="number" min="1" max="16" step="1" readonly required></label>
+<p class="hint">Use the channel assignments configured on your vehicle.</p>
+<legend style="margin-top:24px">MAVLink identities</legend>
+<label class="field"><span>Bridge system ID</span><input name="FLY_GCS_SYSID" type="number" min="1" max="255" step="1" readonly required></label>
+<label class="field"><span>Bridge component ID</span><input name="FLY_GCS_COMPID" type="number" min="1" max="255" step="1" readonly required></label>
+<label class="field"><span>Mission Planner system ID</span><input name="FLY_PLANNER_SYSID" type="number" min="1" max="255" step="1" readonly required></label>
+<label class="field"><span>Mission Planner component ID</span><input name="FLY_PLANNER_COMPID" type="number" min="1" max="255" step="1" readonly required></label>
+</fieldset>
+</div>
+</section>
+</form>
+<section class="card restart" aria-labelledby="restartHeading"><div class="row"><div class="grow"><h2 id="restartHeading">Apply saved settings</h2><p class="muted">Restarting disconnects the active session. Rejoin afterward and resume driving explicitly.</p><p id="pending" hidden>Saved changes are awaiting a bridge restart.</p></div><button id="restart" type="button" disabled>Restart bridge</button></div></section>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const inputs = [...document.querySelectorAll('#settingsForm input[name]')];
+let snapshot = null, token = null, editing = false, busy = false, pendingRestart = false;
+function status(text, kind = '') { $('status').textContent = text; $('status').className = kind; }
+function formSettings() { return Object.fromEntries(inputs.map(input => [input.name, input.value])); }
+function dirty() { return editing && snapshot && inputs.some(input => input.value !== String(snapshot.settings[input.name] ?? '')); }
+function controls() {
+  const ready = !!snapshot && !busy;
+  $('modeBadge').textContent = editing ? 'Editing' : 'Read only';
+  $('modeBadge').classList.toggle('editing', editing);
+  inputs.forEach(input => { input.readOnly = !editing || busy; });
+  $('edit').hidden = editing; $('edit').disabled = !ready;
+  $('save').hidden = !editing; $('save').disabled = !ready;
+  $('cancel').hidden = !editing; $('cancel').disabled = !ready;
+  $('recreate').disabled = !ready || editing;
+  $('restart').disabled = !ready || editing;
+  $('copyLink').disabled = !ready || $('joinLink').hidden;
+  $('pending').hidden = !pendingRestart;
+  $('recreateHint').textContent = editing ? 'Save or cancel edits before recreating the code or restarting.' : 'The running session keeps its current code until the bridge restarts.';
+}
+function render(data) {
+  if (!data || !data.settings || typeof data.settings !== 'object' || typeof data.revision !== 'string') throw new Error('Invalid settings response. Reload this page to try again.');
+  snapshot = data;
+  if (typeof data.token === 'string') token = data.token;
+  inputs.forEach(input => { input.value = String(data.settings[input.name] ?? ''); });
+  $('savedCode').textContent = data.settings.FLY_ROOM_CODE || 'Not configured';
+  const link = $('joinLink'); link.hidden = true; link.removeAttribute('href'); link.textContent = '';
+  try {
+    const url = new URL(data.settings.FLY_SITE_URL);
+    if (url.protocol === 'https:' && data.settings.FLY_ROOM_CODE) {
+      url.hash = 'join=' + encodeURIComponent(data.settings.FLY_ROOM_CODE);
+      link.href = url.href; link.textContent = url.href; link.hidden = false;
+    }
+  } catch {}
+  if (typeof data.pending_restart === 'boolean') pendingRestart = data.pending_restart;
+  controls();
+}
+async function api(path, payload) {
+  const options = {cache:'no-store', credentials:'same-origin', headers:{Accept:'application/json'}};
+  if (payload !== undefined) {
+    if (!token) throw new Error('Missing request token. Reload the page before making changes.');
+    options.method = 'POST'; options.headers['Content-Type'] = 'application/json'; options.headers['X-CSRF-Token'] = token; options.body = JSON.stringify(payload);
+  }
+  const response = await fetch(path, options);
+  let data;
+  try { data = await response.json(); } catch { throw new Error('The settings server returned an unreadable response.'); }
+  if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : `Request failed (${response.status}).`);
+  return data;
+}
+async function perform(action) {
+  if (busy) return;
+  busy = true; controls();
+  try { await action(); } catch (error) { status(error.message || 'Unable to contact the settings server.', 'error'); }
+  finally { busy = false; controls(); }
+}
+$('edit').onclick = () => { if (busy || !snapshot) return; editing = true; status('Editing settings. Changes are not saved until you choose Save changes.'); controls(); inputs[0].focus(); };
+$('cancel').onclick = () => perform(async () => { const data = await api('/api/settings'); render(data); editing = false; status('Edits discarded. Showing the saved settings.'); });
+$('settingsForm').onsubmit = event => {
+  event.preventDefault();
+  if (!editing || !snapshot || !$('settingsForm').reportValidity()) return;
+  const settings = formSettings(), revision = snapshot.revision;
+  perform(async () => { const data = await api('/api/settings', {settings,revision}); render(data); editing = false; pendingRestart = true; status('Settings saved. Restart the bridge when ready to apply them.', 'success'); });
+};
+$('recreate').onclick = () => { if (editing || !snapshot) return; perform(async () => { const data = await api('/api/recreate', {revision:snapshot.revision}); render(data); pendingRestart = true; status('New code generated and saved. Restart the bridge to activate it.', 'success'); }); };
+$('restart').onclick = () => { if (editing || !snapshot) return; perform(async () => { status('Restarting the bridge…'); await api('/api/restart', {}); pendingRestart = false; status('Bridge restart completed. Rejoin using the saved connection link.', 'success'); }); };
+$('copyLink').onclick = async () => {
+  try { await navigator.clipboard.writeText($('joinLink').href); status('Connection link copied.', 'success'); }
+  catch { status('Clipboard is unavailable here. Select and copy the connection link above.'); }
+};
+window.addEventListener('beforeunload', event => { if (dirty()) { event.preventDefault(); event.returnValue = ''; } });
+perform(async () => { render(await api('/api/settings')); status('Settings are read-only. Choose Edit settings to make changes.'); });
+</script>
+</body>
+</html>

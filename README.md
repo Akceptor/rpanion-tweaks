@@ -536,3 +536,72 @@ These checks require the Pi and crawler; they could not run while the Pi was off
 2. Connect Mission Planner to UDP 14550, then separately to Lima UDP 14551. On each, confirm its GCS heartbeat (normally `255/190`) appears on a read-only `tcp:127.0.0.1:5760` pymavlink monitor. If either route is invisible, do not rely on automatic priority until router routing is corrected. UDP 14571 is Lima status, not a MAVLink input for this bridge.
 3. Browser alone: press Resume driving with neutral throttle and test only configured channels. Close the browser; confirm overrides release and no old command is replayed. Connect Mission Planner through each UDP port and verify immediate browser pause and one override release. Disconnect Planner; the browser must remain paused until a new Resume.
 4. Restart Rpanion and the bridge, repeat the neutral/resume check, and test over the actual internet/LTE path. If TURN is configured, verify a relay candidate in browser WebRTC stats when direct ICE fails. Record latency, CPU, and any codec issue here after the Pi test.
+
+## Fly Ground settings page (port 4001)
+
+The optional `fly-ground-settings` service manages `/etc/fly-ground.env` through a
+network page. Settings start read-only; **Edit** unlocks them, **Save** validates
+and stores them, and **Cancel** discards edits. **Recreate code** immediately
+creates and saves a new CRAWLER code. **Restart bridge** is separate: saved
+settings (including a recreated code) take effect only after restart, which ends
+an active session. The page shows the saved code, not proof that the running
+bridge has loaded it.
+
+The service has no login and is intended for the operator's trusted private or
+ZeroTier network. The default bind is `0.0.0.0:4001`; use `--host` with the Pi's
+ZeroTier address to limit it to that interface. It serves only bundled assets,
+requires a CSRF header for changes, and does not enable cross-origin access.
+
+Install from this repository on the Pi (the driving bridge must already be installed):
+
+```sh
+sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_settings.html python/fly_ground_config.py /opt/fly-ground/python/
+sudo install -d -m 0700 /var/lib/fly-ground-settings
+```
+
+Move the existing configuration into the writable state directory, keeping the
+bridge's original filename as a symlink. This preserves the existing settings
+and does not restart the bridge:
+
+```sh
+sudo python3 - <<'PY'
+from pathlib import Path
+import os
+import shutil
+
+source = Path('/etc/fly-ground.env')
+target = Path('/var/lib/fly-ground-settings/fly-ground.env')
+if source.is_symlink():
+    if source.resolve() != target:
+        raise SystemExit('Existing env symlink points elsewhere; leaving it unchanged')
+    if not target.is_file():
+        raise SystemExit('Configuration target is missing')
+else:
+    if not source.is_file():
+        raise SystemExit('Install the bridge configuration first')
+    if target.exists():
+        raise SystemExit('State file already exists; refusing to overwrite it')
+    shutil.copy2(source, target)
+    os.chmod(target, 0o600)
+    link = source.with_name('fly-ground.env.settings-link')
+    link.symlink_to(target)
+    os.replace(link, source)
+print('Configuration path ready')
+PY
+sudo install -m 0644 systemd/fly-ground-settings.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fly-ground-settings
+sudo systemctl status fly-ground-settings --no-pager
+```
+
+Open `http://<pi-network-address>:4001/`. The service uses Python's standard
+library; no additional packages are needed. The unit runs as root to read the
+private environment file and restart the fixed `fly-ground.service` unit. Its
+filesystem writes are confined to `/var/lib/fly-ground-settings`. Configuration
+writes preserve file owner/group and mode 0600. Other environment keys and
+comments are preserved; unsupported environment-file syntax is rejected instead
+of being evaluated as shell code.
+
+After changing the code, copy the new join link, then restart the bridge when
+ready. Existing bookmarks keep the old code and must be replaced. A browser tab
+with unsaved edits must reload if another tab changed the settings.
