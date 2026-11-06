@@ -552,7 +552,23 @@ ZeroTier network. The default bind is `0.0.0.0:4001`; use `--host` with the Pi's
 ZeroTier address to limit it to that interface. It serves only bundled assets,
 requires a CSRF header for changes, and does not enable cross-origin access.
 
-Install from this repository on the Pi (the driving bridge must already be installed):
+### Install on the Raspberry Pi
+
+Run the following commands **on the Pi**, in an SSH session or local terminal.
+The driving bridge must already be installed at `/opt/fly-ground`, with its
+configuration at `/etc/fly-ground.env`. You need Git, Python 3, and sudo access.
+Stop if any command fails; do not continue to the next block.
+
+Fetch the current main branch into a temporary checkout (this leaves any existing
+checkout and local changes untouched):
+
+```sh
+settings_src=$(mktemp -d)
+git clone --depth 1 --branch main https://github.com/Akceptor/rpanion-tweaks.git "$settings_src"
+cd "$settings_src"
+```
+
+Install the settings server and page:
 
 ```sh
 sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_settings.html python/fly_ground_config.py /opt/fly-ground/python/
@@ -594,7 +610,18 @@ sudo systemctl enable --now fly-ground-settings
 sudo systemctl status fly-ground-settings --no-pager
 ```
 
-Open `http://<pi-network-address>:4001/`. The service uses Python's standard
+### Open and use the page
+
+Open `http://<pi-network-address>:4001/` from a device on the same private or
+ZeroTier network. For example, if the Pi is `10.46.93.18`, open
+`http://10.46.93.18:4001/`.
+
+Installation preserves your existing join code and does not restart the driving
+bridge. Use **Edit settings → Save changes** to edit settings, or **Recreate code**
+to generate and save a new code immediately. Click **Restart bridge** when ready
+to activate saved changes; it disconnects the current driving session.
+
+The service uses Python's standard
 library; no additional packages are needed. The unit runs as root to read the
 private environment file and restart the fixed `fly-ground.service` unit. Its
 filesystem writes are confined to `/var/lib/fly-ground-settings`. Configuration
@@ -605,3 +632,19 @@ of being evaluated as shell code.
 After changing the code, copy the new join link, then restart the bridge when
 ready. Existing bookmarks keep the old code and must be replaced. A browser tab
 with unsaved edits must reload if another tab changed the settings.
+
+### Troubleshoot the settings service
+
+If the page does not open, check the service and its recent logs on the Pi:
+
+```sh
+sudo systemctl status fly-ground-settings --no-pager
+sudo journalctl -u fly-ground-settings -n 50 --no-pager
+curl -fsS -o /dev/null http://127.0.0.1:4001/
+```
+
+If localhost works but another device cannot connect, check the Pi address,
+ZeroTier connectivity, and access to TCP port 4001. To update this settings page
+later, repeat the source checkout and file installation steps, then run
+`sudo systemctl restart fly-ground-settings`; restarting the settings service
+does not restart the driving bridge.
