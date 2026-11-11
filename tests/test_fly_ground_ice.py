@@ -15,6 +15,18 @@ STUN = [{"urls": "stun:stun.cloudflare.com:3478"}]
 
 
 class IceServerTest(unittest.TestCase):
+    def test_identifies_turn_requests_to_cloudflare(self):
+        servers = STUN + [{"urls": "turn:turn.cloudflare.com:3478",
+                           "username": "user", "credential": "pass"}]
+
+        def cloudflare(request, timeout):
+            if request.get_header("User-agent") != "fly-ground/1.0":
+                raise HTTPError(request.full_url, 403, "browser_signature_banned", {}, None)
+            return io.BytesIO(json.dumps({"iceServers": servers}).encode())
+
+        with mock.patch("fly_ground.urlopen", side_effect=cloudflare):
+            self.assertEqual(ice_servers("https://site.example"), servers)
+
     def test_uses_turn_response_when_available(self):
         servers = STUN + [{"urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
                            "username": "user", "credential": "pass"}]
