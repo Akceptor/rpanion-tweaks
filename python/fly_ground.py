@@ -58,7 +58,7 @@ def mavlink_connections(settings):
     writer = mavutil.mavlink_connection(settings.router_url, source_system=settings.gcs_sysid,
                                        source_component=settings.gcs_compid, dialect="ardupilotmega")
     try:
-        monitor = mavutil.mavlink_connection(settings.router_url, source_system=254,
+        monitor = mavutil.mavlink_connection(settings.monitor_url, source_system=254,
                                             source_component=192, dialect="ardupilotmega")
     except Exception:
         writer.close()

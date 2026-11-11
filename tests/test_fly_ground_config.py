@@ -30,6 +30,14 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual((s.gcs_sysid, s.gcs_compid), (255, 191))
         self.assertEqual((s.planner_sysid, s.planner_compid), (255, 190))
         self.assertEqual(s.rtsp_url, "rtsp://127.0.0.1:8554/video")
+        self.assertEqual(s.router_url, "udpout:127.0.0.1:14552")
+        self.assertEqual(s.monitor_url, "tcp:127.0.0.1:5760")
+
+    def test_explicit_direct_route_and_separate_monitor_are_supported(self):
+        s = Settings.from_env({"FLY_ROOM_CODE": CODE, "FLY_SITE_URL": "https://example.workers.dev",
+                               "FLY_MAVLINK": "tcp:127.0.0.1:5770", "FLY_MONITOR": "tcp:127.0.0.1:5780"})
+        self.assertEqual(s.router_url, "tcp:127.0.0.1:5770")
+        self.assertEqual(s.monitor_url, "tcp:127.0.0.1:5780")
 
     def test_custom_channels_and_limit(self):
         s = Settings.from_env({"FLY_ROOM_CODE": CODE, "FLY_SITE_URL": "https://example.workers.dev/",
@@ -42,7 +50,8 @@ class SettingsTest(unittest.TestCase):
         base = {"FLY_ROOM_CODE": CODE, "FLY_SITE_URL": "https://example.workers.dev"}
         for bad in ({"FLY_CHANNELS": "1,5"}, {"FLY_CHANNELS": "1,3,3"},
                     {"FLY_GCS_COMPID": "190"}, {"FLY_SITE_URL": "http://example.workers.dev"},
-                    {"FLY_SESSION_SECONDS": "-1"}):
+                    {"FLY_SESSION_SECONDS": "-1"}, {"FLY_MAVLINK": "udpin:0.0.0.0:14552"},
+                    {"FLY_MONITOR": "udpout:127.0.0.1:14552"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 Settings.from_env({**base, **bad})
 

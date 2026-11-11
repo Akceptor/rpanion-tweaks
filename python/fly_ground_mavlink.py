@@ -39,12 +39,24 @@ class MavlinkAdapter:
                     and msg.type != mavlink.MAV_TYPE_GCS
                     and msg.autopilot != mavlink.MAV_AUTOPILOT_INVALID):
                 self.target = (msg.get_srcSystem(), msg.get_srcComponent())
-            if self.target and msg.get_srcSystem() == self.target[0] and kind in TELEMETRY:
+        # Raw router traffic is for ownership/discovery only. Browser telemetry
+        # must come through the configured route (Lima by default).
+        for _ in range(100):
+            msg = self.writer.recv_match(blocking=False)
+            if msg is None:
+                break
+            if self.target and msg.get_srcSystem() == self.target[0] and msg.get_type() in TELEMETRY:
                 if self.on_telemetry:
                     self.on_telemetry(msg)
 
     def send(self, now_ms):
         owner = self.arbiter.owner_at(now_ms)
+        # Register the local Lima client and keep telemetry flowing while an
+        # accepted browser is idle, without sending any RC overrides.
+        if self.arbiter.peer_connected and (self.last_heartbeat_ms is None or now_ms - self.last_heartbeat_ms >= 1000):
+            self.writer.mav.heartbeat_send(mavlink.MAV_TYPE_GCS, mavlink.MAV_AUTOPILOT_INVALID,
+                                           0, 0, mavlink.MAV_STATE_ACTIVE)
+            self.last_heartbeat_ms = now_ms
         if not self.target:
             return
         release = self.arbiter.take_release()
@@ -52,10 +64,6 @@ class MavlinkAdapter:
             self.writer.mav.rc_channels_override_send(*self.target, *release)
         if owner != "browser":
             return
-        if self.last_heartbeat_ms is None or now_ms - self.last_heartbeat_ms >= 1000:
-            self.writer.mav.heartbeat_send(mavlink.MAV_TYPE_GCS, mavlink.MAV_AUTOPILOT_INVALID,
-                                           0, 0, mavlink.MAV_STATE_ACTIVE)
-            self.last_heartbeat_ms = now_ms
         if self.last_override_ms is None or now_ms - self.last_override_ms >= 20:
             values = self.arbiter.output(now_ms)
             if values is not None:

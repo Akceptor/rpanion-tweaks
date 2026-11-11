@@ -229,6 +229,8 @@ sudo systemctl enable --now lima
 
 Lima is a UDP server on port 14551, next to Rpanion's own UDP Server on 14550. The Pi never sends to a GCS first: nothing goes out until a GCS sends Lima a packet, and the GCS must connect to the Pi (see below). Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
 
+Lima also serves one independent local client on `127.0.0.1:14552` for fly-ground. Local and public clients receive the same shifted telemetry without replacing each other. The HUD shows Lima ON while either client is active. Each endpoint retains its latest client and expires it after five seconds without valid traffic.
+
 One-time Rpanion setup, **Flight Controller** page: stop telemetry, add **Telemetry Destinations** → **UDP Client** `127.0.0.1:14580` (keep `14540` and `14570`), start telemetry. Rpanion's UDP/TCP servers can stay as they are.
 
 Then connect the GCS to the Pi (e.g. `10.46.93.18`):
@@ -257,6 +259,7 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 | Variable | Default | Meaning |
 |---|---|---|
 | `LIMA_SERVE` | `0.0.0.0:14551` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
+| `LIMA_LOCAL_SERVE` | `127.0.0.1:14552` | Independent local client endpoint for WebRTC; must use an IPv4 loopback address |
 | `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
 | `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second status for the video HUD (`STATS_LIMA_PORT`): `LIMA <0\|1> <fake_lat> <fake_lon>`, 5 decimals. Deploy Lima and the video-server together: an old HUD rejects this format and shows `Lima: OFF` |
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
@@ -466,7 +469,7 @@ Based on Rpanion Server by Stephen Dade, licensed under GPL-3.0. This modified f
 
 # Fly-by-WebRTC Pi Ground bridge
 
-The `fly-ground` service hosts a browser cockpit session for this Pi. It reads Rpanion's H.264 RTSP feed, sends the same image (including any Rpanion HUD burned into it) over WebRTC, and sends selected browser RC channels to ArduPilot as MAVLink overrides. Mission Planner has priority when its GCS heartbeat is visible on the local mavlink-router monitor. The browser cockpit is served by the fly-by-webrtc site; the Pi service has no separate web UI.
+The `fly-ground` service hosts a browser cockpit session for this Pi. It reads Rpanion's H.264 RTSP feed, sends the same image (including any Rpanion HUD burned into it) over WebRTC, and sends selected browser RC channels to ArduPilot as MAVLink overrides. MAVLink writes and browser telemetry use Lima's local endpoint by default, so position telemetry is shifted consistently with the HUD. Mission Planner has priority when its GCS heartbeat is visible on a separate read-only mavlink-router monitor; raw monitor telemetry never goes to the browser. The browser cockpit is served by the fly-by-webrtc site; the Pi service has no separate web UI.
 
 ## Install (after the Pi is online)
 
@@ -514,7 +517,7 @@ sudo install -o rpanion -g rpanion -m 0600 /tmp/fly-ground.env /etc/fly-ground.e
 rm /tmp/fly-ground.env
 ```
 
-Set `FLY_RTSP_URL=rtsp://...` if needed. Defaults: `FLY_MAVLINK=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. Set `FLY_SESSION_SECONDS=0` only for an intentional unlimited session. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
+Install/update and start Lima first using the instructions above. Defaults: `FLY_MAVLINK=udpout:127.0.0.1:14552`, `FLY_MONITOR=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. Existing installations with an explicit `FLY_MAVLINK=tcp:...` keep that direct route until it is changed to the Lima endpoint. `FLY_MONITOR` is used only for priority and target discovery. An accepted browser keeps Lima active with a heartbeat even while its driving controls are idle. Set `FLY_RTSP_URL=rtsp://...` if needed and `FLY_SESSION_SECONDS=0` only for an intentional unlimited session. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
 
 After the session data channel opens, five seconds without a valid heartbeat reply ends the session and releases its control overrides. The bridge then starts a fresh session so a closed or unreachable browser does not keep the code occupied. This heartbeat timeout also applies when `FLY_SESSION_SECONDS=0`; it is separate from the faster RC-packet watchdog.
 
