@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from urllib.parse import quote, urlsplit
 
 
@@ -39,6 +40,7 @@ def answer_media_summary(sdp):
 
 PONG_WINDOW = 6
 CLOCK_SAMPLES = 10
+HEARTBEAT_TIMEOUT_MS = 5000
 
 
 class PeerProtocol:
@@ -47,6 +49,8 @@ class PeerProtocol:
         self.send = send
         self.session_seconds = session_seconds
         self.started_ms = None
+        self.last_pong_ms = None
+        self.end_reason = None
         self.offset_ms = None
         self.ping_id = 0
         self.sent_pings = {}
@@ -58,6 +62,7 @@ class PeerProtocol:
 
     def open(self, now_ms):
         self.started_ms = now_ms
+        self.last_pong_ms = now_ms
         self.arbiter.peer_connected = True
         self.state(now_ms)
 
@@ -70,7 +75,7 @@ class PeerProtocol:
         self.last_owner = owner
         self.send({"t": "state", "source": "pi", "phase": phase, "owner": owner,
                    "remoteArm": True, "throttleCap": 1, "remainingMs": self.remaining(now_ms),
-                   "reason": "session expired" if self.ended else None})
+                   "reason": self.end_reason if self.ended else None})
 
     def ping(self, now_ms):
         self.ping_id += 1
@@ -110,10 +115,12 @@ class PeerProtocol:
         # Pings go out every 500 ms; on a loaded LTE link RTT exceeds that, so a pong can only
         # match an earlier ping. Keep the lowest-RTT recent sample to resist bufferbloat spikes.
         t0, tp = self.sent_pings.pop(value.get("id"), None), value.get("tp")
-        if t0 is None or value.get("t0") != t0 or not isinstance(tp, (int, float)) or t0 > now_ms:
+        if (t0 is None or value.get("t0") != t0 or type(tp) not in (int, float)
+                or not math.isfinite(tp) or t0 > now_ms):
             return False
         self.clock_samples = (self.clock_samples + [(now_ms - t0, tp - (t0 + now_ms) / 2)])[-CLOCK_SAMPLES:]
         self.offset_ms = min(self.clock_samples)[1]
+        self.last_pong_ms = now_ms
         return True
 
     def tick(self, now_ms):
@@ -122,13 +129,18 @@ class PeerProtocol:
         if self.remaining(now_ms) == 0:
             self.close(now_ms)
             return
+        if now_ms - self.last_pong_ms >= HEARTBEAT_TIMEOUT_MS:
+            LOG.info("Session ended: heartbeat timeout (%sms)", HEARTBEAT_TIMEOUT_MS)
+            self.close(now_ms, "heartbeat timeout")
+            return
         owner = self.arbiter.owner_at(now_ms)
         if owner != self.last_owner:
             self.state(now_ms)
 
-    def close(self, now_ms):
+    def close(self, now_ms, reason="session expired"):
         if not self.ended:
             self.ended = True
+            self.end_reason = reason
             self.arbiter.disconnect()
             if self.started_ms is not None:
                 self.state(now_ms)
