@@ -88,6 +88,54 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(self.sent[-1]["phase"], "ended")
         self.assertEqual(self.arbiter.owner, "idle")
 
+    def test_silent_peer_times_out_at_five_seconds_even_with_unlimited_session(self):
+        self.p.session_seconds = 0
+        self.p.tick(5999)
+        self.assertFalse(self.p.ended)
+        self.p.tick(6000)
+        self.assertTrue(self.p.ended)
+        self.assertFalse(self.arbiter.peer_connected)
+        self.assertEqual(self.sent[-1]["reason"], "heartbeat timeout")
+
+    def test_valid_pong_extends_idle_session_until_five_seconds_after_reply(self):
+        self.p.ping(5000)
+        self.assertTrue(self.p.message({"t": "pong", "id": 1, "t0": 5000, "tp": 5500}, 5500))
+        self.p.tick(10499)
+        self.assertFalse(self.p.ended)
+        self.p.tick(10500)
+        self.assertTrue(self.p.ended)
+
+    def test_invalid_and_replayed_pongs_do_not_extend_session(self):
+        self.p.ping(1000)
+        pong = {"t": "pong", "id": 1, "t0": 1000, "tp": 1100}
+        self.assertTrue(self.p.message(pong, 1100))
+        self.assertFalse(self.p.message(pong, 5900))
+        self.assertFalse(self.p.message({**pong, "id": 999}, 5900))
+        self.p.tick(6100)
+        self.assertTrue(self.p.ended)
+
+    def test_control_traffic_does_not_replace_session_heartbeat(self):
+        self.p.ping(1000)
+        self.p.message({"t": "pong", "id": 1, "t0": 1000, "tp": 1000}, 1000)
+        self.p.control(packet(), 1000)
+        self.assertTrue(self.p.message({"t": "resume"}, 1000))
+        self.assertEqual(self.arbiter.owner, "browser")
+        self.p.control(packet(ts=5999), 5999)
+        self.p.tick(6000)
+        self.assertTrue(self.p.ended)
+        self.assertEqual(self.arbiter.owner, "idle")
+        self.assertFalse(self.p.message({"t": "resume"}, 6001))
+
+    def test_malformed_clock_timestamps_cannot_renew_heartbeat(self):
+        for tp in (False, True, float("nan"), float("inf"), -float("inf"), None, "5500"):
+            with self.subTest(tp=tp):
+                protocol = PeerProtocol(Arbiter(), lambda value: None)
+                protocol.open(1000)
+                protocol.ping(5000)
+                self.assertFalse(protocol.message({"t": "pong", "id": 1, "t0": 5000, "tp": tp}, 5500))
+                protocol.tick(6000)
+                self.assertTrue(protocol.ended)
+
     def test_close_before_channel_opens_has_no_session_state(self):
         arbiter = Arbiter()
         sent = []
@@ -104,6 +152,36 @@ if __name__ == "__main__":
 
 
 class StallTest(unittest.TestCase):
+    def test_buffer_probe_counts_lists_and_corruption_flags(self):
+        from fly_ground_peer import GstPeer
+        from unittest.mock import Mock
+        gst = SimpleNamespace(PadProbeType=SimpleNamespace(BUFFER=1, BUFFER_LIST=2),
+            BufferFlags=SimpleNamespace(CORRUPTED=1, DISCONT=2), PadProbeReturn=SimpleNamespace(OK=0))
+        peer = SimpleNamespace(counts={}, Gst=gst)
+        pad = Mock()
+        GstPeer._count(peer, pad, "pay")
+        mask, probe = pad.add_probe.call_args.args
+        self.assertEqual(mask, 3)
+        buffers = [SimpleNamespace(has_flags=lambda flag: flag == 1),
+                   SimpleNamespace(has_flags=lambda flag: flag == 2)]
+        batch = SimpleNamespace(length=lambda: 2, get=lambda i: buffers[i])
+        probe(pad, SimpleNamespace(type=2, get_buffer_list=lambda: batch))
+        probe(pad, SimpleNamespace(type=1, get_buffer=lambda: buffers[0]))
+        self.assertEqual(peer.counts, {"pay": 3, "pay-corrupted": 2, "pay-discont": 1})
+
+    def test_video_diagnostics_log_caps_and_counts_at_info_without_rtsp_url(self):
+        from fly_ground_peer import GstPeer
+        caps = SimpleNamespace(to_string=lambda: "application/x-rtp,profile-level-id=42c015")
+        pad = SimpleNamespace(get_current_caps=lambda: caps)
+        pay = SimpleNamespace(get_static_pad=lambda name: pad)
+        peer = SimpleNamespace(counts={"depay": 125, "q": 124, "pay": 600}, counts_logged_ms=0,
+                               pipeline=SimpleNamespace(get_by_name=lambda name: pay))
+        with self.assertLogs("fly-ground", level="INFO") as logs:
+            GstPeer.log_counts(peer, 5000)
+        self.assertIn("42c015", " ".join(logs.output))
+        self.assertIn("125", " ".join(logs.output))
+        self.assertEqual(peer.counts_logged_ms, 5000)
+
     def test_rtsp_stall_raises_after_five_silent_seconds(self):
         from fly_ground_peer import GstPeer
         peer = SimpleNamespace(counts={"depay": 0}, stall_check=(None, None))

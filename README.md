@@ -516,6 +516,8 @@ rm /tmp/fly-ground.env
 
 Set `FLY_RTSP_URL=rtsp://...` if needed. Defaults: `FLY_MAVLINK=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. Set `FLY_SESSION_SECONDS=0` only for an intentional unlimited session. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
 
+After the session data channel opens, five seconds without a valid heartbeat reply ends the session and releases its control overrides. The bridge then starts a fresh session so a closed or unreachable browser does not keep the code occupied. This heartbeat timeout also applies when `FLY_SESSION_SECONDS=0`; it is separate from the faster RC-packet watchdog.
+
 Install and start the unit:
 
 ```sh

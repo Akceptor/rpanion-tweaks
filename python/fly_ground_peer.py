@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from urllib.parse import quote, urlsplit
 
 
@@ -39,6 +40,7 @@ def answer_media_summary(sdp):
 
 PONG_WINDOW = 6
 CLOCK_SAMPLES = 10
+HEARTBEAT_TIMEOUT_MS = 5000
 
 
 class PeerProtocol:
@@ -47,6 +49,8 @@ class PeerProtocol:
         self.send = send
         self.session_seconds = session_seconds
         self.started_ms = None
+        self.last_pong_ms = None
+        self.end_reason = None
         self.offset_ms = None
         self.ping_id = 0
         self.sent_pings = {}
@@ -58,6 +62,7 @@ class PeerProtocol:
 
     def open(self, now_ms):
         self.started_ms = now_ms
+        self.last_pong_ms = now_ms
         self.arbiter.peer_connected = True
         self.state(now_ms)
 
@@ -70,7 +75,7 @@ class PeerProtocol:
         self.last_owner = owner
         self.send({"t": "state", "source": "pi", "phase": phase, "owner": owner,
                    "remoteArm": True, "throttleCap": 1, "remainingMs": self.remaining(now_ms),
-                   "reason": "session expired" if self.ended else None})
+                   "reason": self.end_reason if self.ended else None})
 
     def ping(self, now_ms):
         self.ping_id += 1
@@ -110,10 +115,12 @@ class PeerProtocol:
         # Pings go out every 500 ms; on a loaded LTE link RTT exceeds that, so a pong can only
         # match an earlier ping. Keep the lowest-RTT recent sample to resist bufferbloat spikes.
         t0, tp = self.sent_pings.pop(value.get("id"), None), value.get("tp")
-        if t0 is None or value.get("t0") != t0 or not isinstance(tp, (int, float)) or t0 > now_ms:
+        if (t0 is None or value.get("t0") != t0 or type(tp) not in (int, float)
+                or not math.isfinite(tp) or t0 > now_ms):
             return False
         self.clock_samples = (self.clock_samples + [(now_ms - t0, tp - (t0 + now_ms) / 2)])[-CLOCK_SAMPLES:]
         self.offset_ms = min(self.clock_samples)[1]
+        self.last_pong_ms = now_ms
         return True
 
     def tick(self, now_ms):
@@ -122,13 +129,18 @@ class PeerProtocol:
         if self.remaining(now_ms) == 0:
             self.close(now_ms)
             return
+        if now_ms - self.last_pong_ms >= HEARTBEAT_TIMEOUT_MS:
+            LOG.info("Session ended: heartbeat timeout (%sms)", HEARTBEAT_TIMEOUT_MS)
+            self.close(now_ms, "heartbeat timeout")
+            return
         owner = self.arbiter.owner_at(now_ms)
         if owner != self.last_owner:
             self.state(now_ms)
 
-    def close(self, now_ms):
+    def close(self, now_ms, reason="session expired"):
         if not self.ended:
             self.ended = True
+            self.end_reason = reason
             self.arbiter.disconnect()
             if self.started_ms is not None:
                 self.state(now_ms)
@@ -154,13 +166,15 @@ class GstPeer:
         self.loop = asyncio.get_running_loop()
         self.Gst, self.GstSdp, self.GstWebRTC = Gst, GstSdp, GstWebRTC
         self.signal, self.protocol, self.on_closed = signal, protocol, on_closed
-        # One keyframe is dozens of RTP packets with one timestamp: a buffer-count limit on this
-        # leaky queue drops part of every frame, so it is bounded by time instead.
+        # Bound latency before packetization, on complete H.264 access units.
+        # Leaking RTP packets can truncate frames during motion/bitrate bursts;
+        # packets discarded there never reach webrtcbin's retransmission buffer.
         self.pipeline = Gst.parse_launch(
             "webrtcbin name=webrtc bundle-policy=max-bundle "
             "rtspsrc name=source protocols=tcp latency=0 ! rtph264depay name=depay ! h264parse "
-            "! rtph264pay name=pay config-interval=1 pt=96 "
+            "! video/x-h264,alignment=au "
             "! queue name=q max-size-buffers=0 max-size-bytes=0 max-size-time=300000000 leaky=downstream "
+            "! rtph264pay name=pay config-interval=1 pt=96 "
             f"! {VIDEO_CAPS} ! webrtc.")
         self.pipeline.get_by_name("source").set_property("location", rtsp_url)
         self.webrtc = self.pipeline.get_by_name("webrtc")
@@ -192,6 +206,7 @@ class GstPeer:
         self.stall_check = (None, None)
         for name, pad in (("depay", "src"), ("pay", "src"), ("q", "src")):
             self._count(self.pipeline.get_by_name(name).get_static_pad(pad), name)
+        self._count(self.pipeline.get_by_name("q").get_static_pad("sink"), "q-in")
         self.bus = self.pipeline.get_bus()
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -270,19 +285,30 @@ class GstPeer:
 
     def _count(self, pad, name):
         self.counts[name] = 0
+        self.counts[name + "-corrupted"] = 0
+        self.counts[name + "-discont"] = 0
 
-        def probe(_pad, _info):
-            self.counts[name] += 1
+        def probe(_pad, info):
+            if info.type & self.Gst.PadProbeType.BUFFER_LIST:
+                batch = info.get_buffer_list()
+                buffers = [batch.get(i) for i in range(batch.length())]
+            else:
+                buffers = [info.get_buffer()]
+            for buffer in buffers:
+                self.counts[name] += 1
+                for suffix, flag in (("-corrupted", self.Gst.BufferFlags.CORRUPTED),
+                                     ("-discont", self.Gst.BufferFlags.DISCONT)):
+                    self.counts[name + suffix] += int(buffer.has_flags(flag))
             return self.Gst.PadProbeReturn.OK
-        pad.add_probe(self.Gst.PadProbeType.BUFFER, probe)
+        pad.add_probe(self.Gst.PadProbeType.BUFFER | self.Gst.PadProbeType.BUFFER_LIST, probe)
 
     def log_counts(self, now_ms):
-        if now_ms - self.counts_logged_ms < 5000 or not LOG.isEnabledFor(logging.DEBUG):
+        if now_ms - self.counts_logged_ms < 5000:
             return
         self.counts_logged_ms = now_ms
         caps = self.pipeline.get_by_name("pay").get_static_pad("src").get_current_caps()
-        LOG.debug("Buffers %s; pay caps %s", self.counts,
-                 caps.to_string()[:300] if caps is not None else None)
+        LOG.info("Video buffers %s; pay caps %s", self.counts,
+                 caps.to_string() if caps is not None else None)
 
     def _remote_set(self, promise, *_user_data):
         reply = promise.get_reply()
