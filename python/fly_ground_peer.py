@@ -154,13 +154,15 @@ class GstPeer:
         self.loop = asyncio.get_running_loop()
         self.Gst, self.GstSdp, self.GstWebRTC = Gst, GstSdp, GstWebRTC
         self.signal, self.protocol, self.on_closed = signal, protocol, on_closed
-        # One keyframe is dozens of RTP packets with one timestamp: a buffer-count limit on this
-        # leaky queue drops part of every frame, so it is bounded by time instead.
+        # Bound latency before packetization, on complete H.264 access units.
+        # Leaking RTP packets can truncate frames during motion/bitrate bursts;
+        # packets discarded there never reach webrtcbin's retransmission buffer.
         self.pipeline = Gst.parse_launch(
             "webrtcbin name=webrtc bundle-policy=max-bundle "
             "rtspsrc name=source protocols=tcp latency=0 ! rtph264depay name=depay ! h264parse "
-            "! rtph264pay name=pay config-interval=1 pt=96 "
+            "! video/x-h264,alignment=au "
             "! queue name=q max-size-buffers=0 max-size-bytes=0 max-size-time=300000000 leaky=downstream "
+            "! rtph264pay name=pay config-interval=1 pt=96 "
             f"! {VIDEO_CAPS} ! webrtc.")
         self.pipeline.get_by_name("source").set_property("location", rtsp_url)
         self.webrtc = self.pipeline.get_by_name("webrtc")
