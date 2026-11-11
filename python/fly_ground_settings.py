@@ -21,7 +21,7 @@ from fly_ground_auth import validate_host_token
 
 FIELDS = {
     'FLY_ROOM_CODE': 'code', 'FLY_SITE_URL': 'site_url', 'FLY_RTSP_URL': 'rtsp_url',
-    'FLY_MAVLINK': 'router_url', 'FLY_CHANNELS': 'channels',
+    'FLY_MAVLINK': 'router_url', 'FLY_MONITOR': 'monitor_url', 'FLY_CHANNELS': 'channels',
     'FLY_THROTTLE_CHANNEL': 'throttle_channel', 'FLY_GCS_SYSID': 'gcs_sysid',
     'FLY_GCS_COMPID': 'gcs_compid', 'FLY_PLANNER_SYSID': 'planner_sysid',
     'FLY_PLANNER_COMPID': 'planner_compid', 'FLY_SESSION_SECONDS': 'session_seconds',
