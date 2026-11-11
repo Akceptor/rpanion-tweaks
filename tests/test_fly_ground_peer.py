@@ -104,6 +104,36 @@ if __name__ == "__main__":
 
 
 class StallTest(unittest.TestCase):
+    def test_buffer_probe_counts_lists_and_corruption_flags(self):
+        from fly_ground_peer import GstPeer
+        from unittest.mock import Mock
+        gst = SimpleNamespace(PadProbeType=SimpleNamespace(BUFFER=1, BUFFER_LIST=2),
+            BufferFlags=SimpleNamespace(CORRUPTED=1, DISCONT=2), PadProbeReturn=SimpleNamespace(OK=0))
+        peer = SimpleNamespace(counts={}, Gst=gst)
+        pad = Mock()
+        GstPeer._count(peer, pad, "pay")
+        mask, probe = pad.add_probe.call_args.args
+        self.assertEqual(mask, 3)
+        buffers = [SimpleNamespace(has_flags=lambda flag: flag == 1),
+                   SimpleNamespace(has_flags=lambda flag: flag == 2)]
+        batch = SimpleNamespace(length=lambda: 2, get=lambda i: buffers[i])
+        probe(pad, SimpleNamespace(type=2, get_buffer_list=lambda: batch))
+        probe(pad, SimpleNamespace(type=1, get_buffer=lambda: buffers[0]))
+        self.assertEqual(peer.counts, {"pay": 3, "pay-corrupted": 2, "pay-discont": 1})
+
+    def test_video_diagnostics_log_caps_and_counts_at_info_without_rtsp_url(self):
+        from fly_ground_peer import GstPeer
+        caps = SimpleNamespace(to_string=lambda: "application/x-rtp,profile-level-id=42c015")
+        pad = SimpleNamespace(get_current_caps=lambda: caps)
+        pay = SimpleNamespace(get_static_pad=lambda name: pad)
+        peer = SimpleNamespace(counts={"depay": 125, "q": 124, "pay": 600}, counts_logged_ms=0,
+                               pipeline=SimpleNamespace(get_by_name=lambda name: pay))
+        with self.assertLogs("fly-ground", level="INFO") as logs:
+            GstPeer.log_counts(peer, 5000)
+        self.assertIn("42c015", " ".join(logs.output))
+        self.assertIn("125", " ".join(logs.output))
+        self.assertEqual(peer.counts_logged_ms, 5000)
+
     def test_rtsp_stall_raises_after_five_silent_seconds(self):
         from fly_ground_peer import GstPeer
         peer = SimpleNamespace(counts={"depay": 0}, stall_check=(None, None))

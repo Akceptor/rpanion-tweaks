@@ -194,6 +194,7 @@ class GstPeer:
         self.stall_check = (None, None)
         for name, pad in (("depay", "src"), ("pay", "src"), ("q", "src")):
             self._count(self.pipeline.get_by_name(name).get_static_pad(pad), name)
+        self._count(self.pipeline.get_by_name("q").get_static_pad("sink"), "q-in")
         self.bus = self.pipeline.get_bus()
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -272,19 +273,30 @@ class GstPeer:
 
     def _count(self, pad, name):
         self.counts[name] = 0
+        self.counts[name + "-corrupted"] = 0
+        self.counts[name + "-discont"] = 0
 
-        def probe(_pad, _info):
-            self.counts[name] += 1
+        def probe(_pad, info):
+            if info.type & self.Gst.PadProbeType.BUFFER_LIST:
+                batch = info.get_buffer_list()
+                buffers = [batch.get(i) for i in range(batch.length())]
+            else:
+                buffers = [info.get_buffer()]
+            for buffer in buffers:
+                self.counts[name] += 1
+                for suffix, flag in (("-corrupted", self.Gst.BufferFlags.CORRUPTED),
+                                     ("-discont", self.Gst.BufferFlags.DISCONT)):
+                    self.counts[name + suffix] += int(buffer.has_flags(flag))
             return self.Gst.PadProbeReturn.OK
-        pad.add_probe(self.Gst.PadProbeType.BUFFER, probe)
+        pad.add_probe(self.Gst.PadProbeType.BUFFER | self.Gst.PadProbeType.BUFFER_LIST, probe)
 
     def log_counts(self, now_ms):
-        if now_ms - self.counts_logged_ms < 5000 or not LOG.isEnabledFor(logging.DEBUG):
+        if now_ms - self.counts_logged_ms < 5000:
             return
         self.counts_logged_ms = now_ms
         caps = self.pipeline.get_by_name("pay").get_static_pad("src").get_current_caps()
-        LOG.debug("Buffers %s; pay caps %s", self.counts,
-                 caps.to_string()[:300] if caps is not None else None)
+        LOG.info("Video buffers %s; pay caps %s", self.counts,
+                 caps.to_string() if caps is not None else None)
 
     def _remote_set(self, promise, *_user_data):
         reply = promise.get_reply()
