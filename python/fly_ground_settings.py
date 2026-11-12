@@ -17,6 +17,7 @@ import tempfile
 import threading
 
 from fly_ground_config import Settings
+from fly_ground_auth import validate_host_token
 
 FIELDS = {
     'FLY_ROOM_CODE': 'code', 'FLY_SITE_URL': 'site_url', 'FLY_RTSP_URL': 'rtsp_url',
@@ -40,11 +41,11 @@ def clean_value(value):
     return value
 
 
-def parse_env(raw):
+def parse_env(raw, fields=FIELDS):
     env = {}
     for line in raw.decode('utf-8').splitlines():
         match = ASSIGN.match(line)
-        if not match or match[1] not in FIELDS:
+        if not match or match[1] not in fields:
             continue
         value = match[2].strip()
         if value[:1] in ('"', "'"):
@@ -53,6 +54,14 @@ def parse_env(raw):
             value = value[1:-1]
         env[match[1]] = clean_value(value)
     return env
+
+
+def host_token_configured(raw):
+    try:
+        validate_host_token(parse_env(raw, {'FLY_HOST_TOKEN'}).get('FLY_HOST_TOKEN'))
+        return True
+    except ValueError:
+        return False
 
 
 def normalized(env):
@@ -69,6 +78,7 @@ class ConfigStore:
     def _read(self):
         raw = self.path.read_bytes()
         return raw, {'settings': normalized(parse_env(raw)),
+                     'host_token_configured': host_token_configured(raw),
                      'revision': hashlib.sha256(raw).hexdigest()}
 
     def read(self):
@@ -127,6 +137,17 @@ class ConfigStore:
         code = 'CRAWLER-' + '-'.join(''.join(secrets.choice(ALPHABET) for _ in range(4)) for _ in range(3))
         with self.lock:
             return self._write({'FLY_ROOM_CODE': code}, revision)
+
+    def set_host_token(self, token, revision):
+        if token != '':
+            validate_host_token(token)
+        with self.lock:
+            if token == '':
+                current = self._read()[1]
+                if not isinstance(revision, str) or revision != current['revision']:
+                    raise Conflict('Settings changed; reload before saving')
+                return current
+            return self._write({'FLY_HOST_TOKEN': token}, revision)
 
 
 def restart_service():
@@ -190,6 +211,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.store.save(data.get('settings'), data.get('revision'))
             elif self.path == '/api/recreate':
                 result = self.server.store.recreate(data.get('revision'))
+            elif self.path == '/api/host-token':
+                if set(data) != {'token', 'revision'}:
+                    raise ValueError('Supply exactly token and revision')
+                result = self.server.store.set_host_token(data['token'], data['revision'])
             elif self.path == '/api/restart':
                 self.server.restart(); self.respond(200, {'ok': True}); return
             else: self.respond(404, {'error': 'Not found'}); return

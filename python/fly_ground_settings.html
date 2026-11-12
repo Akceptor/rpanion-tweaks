@@ -45,6 +45,14 @@
 </div>
 </section>
 </form>
+<section class="card" aria-labelledby="hostTokenHeading">
+<h2 id="hostTokenHeading">Pi host secret</h2>
+<p id="hostTokenState" class="muted">Checking saved secret…</p>
+<p class="muted">Use the same secret configured in your cockpit Worker. Saved secrets are never displayed. Keep this administration page on your trusted network.</p>
+<label class="field"><span>New host secret (leave blank to keep the saved value)</span><input id="hostToken" type="password" autocomplete="new-password" spellcheck="false" minlength="43" maxlength="43" pattern="[A-Za-z0-9_-]{43}" aria-describedby="hostTokenHint"></label>
+<button id="saveHostToken" type="button" disabled>Save host secret</button>
+<p id="hostTokenHint" class="hint">Save the secret, then restart the bridge to apply it. Connection links never include this secret.</p>
+</section>
 <section class="card restart" aria-labelledby="restartHeading"><div class="row"><div class="grow"><h2 id="restartHeading">Apply saved settings</h2><p class="muted">Restarting disconnects the active session. Rejoin afterward and resume driving explicitly.</p><p id="pending" hidden>Saved changes are awaiting a bridge restart.</p></div><button id="restart" type="button" disabled>Restart bridge</button></div></section>
 </main>
 <script>
@@ -66,12 +74,15 @@ function controls() {
   $('recreate').disabled = !ready || editing;
   $('restart').disabled = !ready || editing;
   $('copyLink').disabled = !ready || $('joinLink').hidden;
+  $('hostToken').disabled = !ready || editing;
+  $('saveHostToken').disabled = !ready || editing || !$('hostToken').value;
   $('pending').hidden = !pendingRestart;
   $('recreateHint').textContent = editing ? 'Save or cancel edits before recreating the code or restarting.' : 'The running session keeps its current code until the bridge restarts.';
 }
 function render(data) {
   if (!data || !data.settings || typeof data.settings !== 'object' || typeof data.revision !== 'string') throw new Error('Invalid settings response. Reload this page to try again.');
   snapshot = data;
+  $('hostTokenState').textContent = data.host_token_configured ? 'A host secret is configured. Its saved value cannot be read back.' : 'No valid host secret is configured. The bridge cannot create a room yet.';
   if (typeof data.token === 'string') token = data.token;
   inputs.forEach(input => { input.value = String(data.settings[input.name] ?? ''); });
   $('savedCode').textContent = data.settings.FLY_ROOM_CODE || 'Not configured';
@@ -113,6 +124,15 @@ $('settingsForm').onsubmit = event => {
   perform(async () => { const data = await api('/api/settings', {settings,revision}); render(data); editing = false; pendingRestart = true; status('Settings saved. Restart the bridge when ready to apply them.', 'success'); });
 };
 $('recreate').onclick = () => { if (editing || !snapshot) return; perform(async () => { const data = await api('/api/recreate', {revision:snapshot.revision}); render(data); pendingRestart = true; status('New code generated and saved. Restart the bridge to activate it.', 'success'); }); };
+$('hostToken').oninput = controls;
+$('saveHostToken').onclick = () => {
+  if (editing || !snapshot || !$('hostToken').value || !$('hostToken').reportValidity()) return;
+  perform(async () => {
+    const data = await api('/api/host-token', {token:$('hostToken').value, revision:snapshot.revision});
+    $('hostToken').value = ''; render(data); pendingRestart = true;
+    status('Host secret saved. Restart the bridge to apply it.', 'success');
+  });
+};
 $('restart').onclick = () => { if (editing || !snapshot) return; perform(async () => { status('Restarting the bridge…'); await api('/api/restart', {}); pendingRestart = false; status('Bridge restart completed. Rejoin using the saved connection link.', 'success'); }); };
 $('copyLink').onclick = async () => {
   try { await navigator.clipboard.writeText($('joinLink').href); status('Connection link copied.', 'success'); }
