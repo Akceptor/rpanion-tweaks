@@ -30,15 +30,22 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(vs.video_options(self.args(multirtsp='a;b'), env), (5601, None))
 
     def test_fanout_uses_one_camera_pipeline_and_element_destinations(self):
-        sink, pipeline = Mock(), Mock()
-        pipeline.get_by_name.return_value = sink
+        pipeline = Mock()
+        elements = {name: Mock() for name in ('output', 'local_output', 'remote_pay', 'pay0')}
+        pipeline.get_by_name.side_effect = elements.__getitem__
         with patch.object(vs, 'getPipeline', return_value='camera ! rtph264pay') as camera, \
                 patch.object(vs.Gst, 'parse_launch', return_value=pipeline) as launch:
             self.assertIs(vs.build_rtp_pipeline(self.args(), 5601), pipeline)
-        camera.assert_called_once()
-        launch.assert_called_once_with('camera ! rtph264pay ! multiudpsink name=output')
-        self.assertEqual(sink.emit.call_args_list, [unittest.mock.call('add', '192.0.2.1', 5600),
-                                                  unittest.mock.call('add', '127.0.0.1', 5601)])
+        self.assertFalse(camera.call_args.kwargs['payload'])
+        chain = launch.call_args.args[0]
+        self.assertIn('h264parse ! video/x-h264,alignment=au ! tee', chain)
+        self.assertEqual(chain.count('leaky=downstream ! rtph264pay'), 2)
+        elements['output'].set_property.assert_any_call('host', '192.0.2.1')
+        elements['output'].set_property.assert_any_call('port', 5600)
+        elements['local_output'].set_property.assert_any_call('host', '127.0.0.1')
+        elements['local_output'].set_property.assert_any_call('port', 5601)
+        self.assertEqual(elements['remote_pay'].set_property.call_args_list,
+                         elements['pay0'].set_property.call_args_list)
 
     def test_legacy_sink_and_multicast(self):
         sink, pipeline = Mock(), Mock()
@@ -50,6 +57,27 @@ class TransportTest(unittest.TestCase):
         sink.set_property.assert_any_call('host', '239.1.2.3')
         sink.set_property.assert_any_call('port', 5600)
         sink.set_property.assert_any_call('auto-multicast', True)
+
+    def test_duplicate_destination_is_sent_once(self):
+        sink, pipeline = Mock(), Mock()
+        pipeline.get_by_name.return_value = sink
+        with patch.object(vs, 'getPipeline', return_value='camera') as camera, \
+                patch.object(vs.Gst, 'parse_launch', return_value=pipeline) as launch:
+            vs.build_rtp_pipeline(self.args(udp='127.0.0.1:5601'), 5601)
+        launch.assert_called_once_with('camera ! udpsink name=output')
+        self.assertEqual(sink.set_property.call_args_list,
+                         [unittest.mock.call('host', '127.0.0.1'), unittest.mock.call('port', 5601)])
+        self.assertNotIn('payload', camera.call_args.kwargs)
+
+    def test_preencoded_h265_uses_h265_access_units_and_payloaders(self):
+        pipeline = Mock()
+        with patch.object(vs, 'getPipeline', return_value='camera'), \
+                patch.object(vs.Gst, 'parse_launch', return_value=pipeline) as launch:
+            vs.build_rtp_pipeline(self.args(format='video/x-h265'), 5601)
+        chain = launch.call_args.args[0]
+        self.assertIn('h265parse ! video/x-h265,alignment=au', chain)
+        self.assertEqual(chain.count('rtph265pay'), 2)
+        self.assertNotIn('rtph264pay', chain)
 
 
 class LifecycleTest(unittest.TestCase):
