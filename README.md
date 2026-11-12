@@ -494,7 +494,9 @@ sudo chmod -R a+rX /opt/fly-ground/venv/lib/python*/site-packages
 sudo -u rpanion env PYTHONNOUSERSITE=1 /opt/fly-ground/venv/bin/python -c 'import gi, websockets; from pymavlink.dialects.v20 import ardupilotmega; print("ok")'
 ```
 
-Run those commands from this repository's root. TURN is optional: the Pi and browser use Cloudflare STUN when `/turn` is unavailable. STUN-only sessions depend on a direct WebRTC path and may fail across LTE or restrictive NAT. For reliable internet sessions, configure Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN`; the Pi fetches short-lived credentials from `/turn`, never the long-lived key.
+Run those commands from this repository's root. Configure Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN` for reliable internet sessions. The Worker issues separate temporary TURN credentials to each admitted peer over signaling; the public `/turn` endpoint no longer issues credentials. If TURN is unavailable, an authorized session may use Cloudflare STUN only, which can fail across LTE or restrictive NAT.
+
+The Pi must authenticate room creation with `FLY_HOST_TOKEN`. After creating the environment file below and installing the settings page, generate a random 32-byte base64url secret (43 characters), configure it as the Worker's `FLY_HOST_TOKEN` secret, and save the same value using **Pi host secret** on the port 4001 settings page. The page stores it in `/etc/fly-ground.env` with mode `0600` and never returns the saved value. Restart the bridge after saving. Keep the secret out of connection links, source control, and command-line arguments. A missing or invalid secret prevents the bridge from starting; a mismatched secret is rejected by the Worker. Browser-hosted Ground sessions are disabled on this Pi-only deployment.
 
 Create one room code and a private environment file. Replace `https://YOUR-SITE` with the actual fly-by-webrtc origin and set the real RTSP URL if different. The command prints the bookmark once; keep it private because the code allows video viewing.
 
@@ -514,9 +516,11 @@ sudo install -o rpanion -g rpanion -m 0600 /tmp/fly-ground.env /etc/fly-ground.e
 rm /tmp/fly-ground.env
 ```
 
-Set `FLY_RTSP_URL=rtsp://...` if needed. Defaults: `FLY_MAVLINK=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. Set `FLY_SESSION_SECONDS=0` only for an intentional unlimited session. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
+Set `FLY_RTSP_URL=rtsp://...` if needed. Defaults: `FLY_MAVLINK=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. `FLY_SESSION_SECONDS=0` disables the local duration limit, but the Worker still ends a connection before its temporary relay credentials expire (currently two hours, with a one-minute margin). Rejoin the same link for fresh credentials; no owner-key rotation is required. Default one-hour sessions retain their local limit. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
 
 After the session data channel opens, five seconds without a valid heartbeat reply ends the session and releases its control overrides. The bridge then starts a fresh session so a closed or unreachable browser does not keep the code occupied. This heartbeat timeout also applies when `FLY_SESSION_SECONDS=0`; it is separate from the faster RC-packet watchdog.
+
+Signaling now stays connected throughout media/control use. The Pi sends an owner heartbeat every 20 seconds, and missing acknowledgments for 60 seconds ends the session. Closing signaling ends the connection and releases overrides. The Worker revokes both peers' temporary TURN credentials on session end, retrying failed revocations until success or credential expiry. An invited participant can copy the credentials delivered to their browser and reuse them until revocation takes effect or expiry; possession of the Worker URL alone no longer grants credentials or room creation.
 
 Install and start the unit:
 
@@ -548,6 +552,13 @@ creates and saves a new CRAWLER code. **Restart bridge** is separate: saved
 settings (including a recreated code) take effect only after restart, which ends
 an active session. The page shows the saved code, not proof that the running
 bridge has loaded it.
+
+**Pi host secret** is a separate write-only field. Its status says whether a valid
+secret is configured; it never displays or returns that value. Enter a replacement
+and choose **Save host secret**, then **Restart bridge**. A blank field preserves
+the existing value. Normal settings changes and code recreation also preserve it.
+Use the same value for the Worker's `FLY_HOST_TOKEN` secret. Room-link recipients
+do not need this secret or an extra login.
 
 The service has no login and is intended for the operator's trusted private or
 ZeroTier network. The default bind is `0.0.0.0:4001`; use `--host` with the Pi's
