@@ -1,5 +1,6 @@
 """Real GStreamer loopback checks; no camera or remote services required."""
 import importlib.util
+import re
 from pathlib import Path
 import socket
 import sys
@@ -95,6 +96,25 @@ class FanoutTest(unittest.TestCase):
             frames += bool(packet[1] & 0x80)
         self.assertGreaterEqual(frames, 20)
         self.assertLessEqual(frames, 32, 'synthetic source ran faster than its configured frame rate')
+
+    def test_software_encoder_emits_browser_constrained_baseline_h264(self):
+        with patch.object(self.server, 'is_pi_5_or_later', return_value=False):
+            chain = self.server.getPipeline('testsrc', 480, 640, 500, 'video/x-raw',
+                                            0, 25, False, 'H264', payload=False)
+        pipeline = Gst.parse_launch(chain + ' ! h264parse '
+            '! video/x-h264,stream-format=byte-stream,alignment=au '
+            '! appsink name=encoded sync=false')
+        self.addCleanup(pipeline.set_state, Gst.State.NULL)
+        pipeline.set_state(Gst.State.PLAYING)
+        sample = pipeline.get_by_name('encoded').emit('try-pull-sample', 4 * Gst.SECOND)
+        self.assertIsNotNone(sample)
+        buffer = sample.get_buffer()
+        data = buffer.extract_dup(0, buffer.get_size())
+        nals = [nal for nal in re.split(b'\x00\x00\x00?\x01', data) if nal]
+        sps = next(nal for nal in nals if nal[0] & 31 == 7)
+        self.assertEqual(sps[1], 66, 'software encoder emitted optional High/Main H264 profile')
+        self.assertTrue(sps[2] & 0x40, 'baseline stream is missing constraint_set1_flag')
+        self.assertEqual(sample.get_caps().get_structure(0).get_string('profile'), 'constrained-baseline')
 
     def test_unreachable_remote_does_not_stop_local(self):
         local = self.receiver()

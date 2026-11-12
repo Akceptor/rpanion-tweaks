@@ -1077,6 +1077,9 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
             if compression == "H264":
                 # Use multiple threads for software encoding
                 pipeline.append("x264enc tune=zerolatency bitrate={0} speed-preset=superfast key-int-max=25 threads=0".format(bitrate))
+                # WebRTC mandates Constrained Baseline; High profile support and
+                # recovery vary between browser hardware/software decoders.
+                pipeline.append("video/x-h264,profile=constrained-baseline")
             elif compression == "H265":
                 pipeline.append("x265enc tune=zerolatency bitrate={0} speed-preset=superfast key-int-max=25".format(bitrate))
 
