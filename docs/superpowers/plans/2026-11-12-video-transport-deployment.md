@@ -35,6 +35,8 @@ A subsequent RTSP-only verification assertion rejected the now-selected RTP mode
 and automatically rolled back. The final deployment derived the selected mode
 from the live producer, preserved it and completed successfully.
 
-Not verified here: receiving/decoding on the Mission Planner PC, browser video
+The user confirmed the deployed setup works after the service and packet checks.
+
+Not independently verified here: receiving/decoding on the Mission Planner PC, browser video
 negotiation, live RTP-to-RTSP-to-RTP switching, Lima HUD visual transitions, or the
 15-minute moving-image acceptance run. No driving commands were sent.
