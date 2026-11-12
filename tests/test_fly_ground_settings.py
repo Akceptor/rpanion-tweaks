@@ -1,4 +1,5 @@
 import http.client
+import base64
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from fly_ground_settings import ConfigStore, SettingsServer, Conflict
 
 BASE = '# comment\nFLY_ROOM_CODE=CRAWLER-1234-5678-9012\nFLY_SITE_URL="https://example.com"\nEXTRA="keep me"\n'
+HOST_TOKEN = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip('=')
+NEW_HOST_TOKEN = base64.urlsafe_b64encode(bytes(reversed(range(32)))).decode().rstrip('=')
 
 class StoreTest(unittest.TestCase):
     def setUp(self):
@@ -61,6 +64,40 @@ class StoreTest(unittest.TestCase):
         self.path.write_text(BASE.replace('https://example.com', 'https://example.com\\'))
         with self.assertRaises(ValueError): self.store.read()
 
+    def test_host_token_is_write_only_and_preserved_by_normal_edits(self):
+        old = self.store.read()
+        self.assertFalse(old['host_token_configured'])
+        saved = self.store.set_host_token(HOST_TOKEN, old['revision'])
+        self.assertTrue(saved['host_token_configured'])
+        self.assertNotIn(HOST_TOKEN, json.dumps(saved))
+        self.assertNotIn('FLY_HOST_TOKEN', saved['settings'])
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        changed = self.store.save(saved['settings'], saved['revision'])
+        recreated = self.store.recreate(changed['revision'])
+        self.assertIn('FLY_HOST_TOKEN="' + HOST_TOKEN + '"', self.path.read_text())
+        self.assertTrue(recreated['host_token_configured'])
+
+    def test_host_token_replacement_removes_duplicates_and_blank_preserves(self):
+        self.path.write_text(BASE + 'FLY_HOST_TOKEN=' + HOST_TOKEN + '\nFLY_HOST_TOKEN=' + HOST_TOKEN + '\n')
+        old = self.store.read()
+        replaced = self.store.set_host_token(NEW_HOST_TOKEN, old['revision'])
+        self.assertEqual(self.path.read_text().count('FLY_HOST_TOKEN='), 1)
+        self.assertNotIn(HOST_TOKEN, self.path.read_text())
+        before = self.path.read_bytes()
+        unchanged = self.store.set_host_token('', replaced['revision'])
+        self.assertEqual(unchanged['revision'], replaced['revision'])
+        self.assertEqual(before, self.path.read_bytes())
+        with self.assertRaises(Conflict): self.store.set_host_token('', old['revision'])
+        for invalid in (None, 'secret', HOST_TOKEN + '\n'):
+            with self.assertRaises(ValueError): self.store.set_host_token(invalid, replaced['revision'])
+        self.assertEqual(before, self.path.read_bytes())
+
+    def test_existing_bad_token_does_not_prevent_owner_replacing_it(self):
+        self.path.write_text(BASE + 'FLY_HOST_TOKEN="wrong"\n')
+        old = self.store.read()
+        self.assertFalse(old['host_token_configured'])
+        self.assertTrue(self.store.set_host_token(HOST_TOKEN, old['revision'])['host_token_configured'])
+
 class HttpTest(StoreTest):
     def setUp(self):
         super().setUp()
@@ -85,6 +122,9 @@ class HttpTest(StoreTest):
         self.assertEqual(response.getheader('Cache-Control'), 'no-store')
         self.assertIn('id="recreate"', body)
         self.assertIn('readonly', body)
+        self.assertIn('id="hostToken" type="password"', body)
+        self.assertIn('id="saveHostToken"', body)
+        self.assertIn("api('/api/host-token'", body)
         conn.close()
 
     def test_api_csrf_revision_and_restart(self):
@@ -99,5 +139,24 @@ class HttpTest(StoreTest):
         self.assertFalse(self.restarts)
         self.assertEqual(self.request('POST','/api/restart',{},headers)[0],200)
         self.assertEqual(self.restarts,[True])
+
+    def test_host_token_api_checks_csrf_shape_revision_and_never_echoes_secret(self):
+        _, old = self.request('GET', '/api/settings')
+        body = {'token': HOST_TOKEN, 'revision': old['revision']}
+        headers = {'Content-Type': 'application/json', 'X-CSRF-Token': old['token']}
+        self.assertEqual(self.request('POST', '/api/host-token', body)[0], 403)
+        self.assertEqual(self.request('POST', '/api/host-token', body, dict(headers, Origin='http://evil.example'))[0], 403)
+        for bad in ({'token': HOST_TOKEN}, dict(body, extra='bad'), dict(body, token='bad')):
+            status, reply = self.request('POST', '/api/host-token', bad, headers)
+            self.assertEqual(status, 400)
+            self.assertNotIn(HOST_TOKEN, json.dumps(reply))
+        status, saved = self.request('POST', '/api/host-token', body, headers)
+        self.assertEqual(status, 200)
+        self.assertTrue(saved['host_token_configured'])
+        self.assertNotIn(HOST_TOKEN, json.dumps(saved))
+        self.assertEqual(self.request('POST', '/api/host-token', body, headers)[0], 409)
+        _, state = self.request('GET', '/api/settings')
+        self.assertTrue(state['host_token_configured'])
+        self.assertNotIn(HOST_TOKEN, json.dumps(state))
 
 if __name__ == '__main__': unittest.main()

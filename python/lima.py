@@ -380,6 +380,13 @@ def parse_hostport(s):
     return host, int(port)
 
 
+def parse_local_hostport(s):
+    endpoint = parse_hostport(s)
+    if not ipaddress.IPv4Address(endpoint[0]).is_loopback:
+        raise ValueError("local endpoint must use an IPv4 loopback address")
+    return endpoint
+
+
 def parse_latlon(s):
     parts = s.split(",")
     if len(parts) != 2:
@@ -410,26 +417,33 @@ def status_datagram(on, fake):
     return f"LIMA {int(on)} {fake[0]:.5f} {fake[1]:.5f}".encode("ascii")
 
 
-def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic, status=None):
+def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic, status=None, local_serve=None):
     from_router = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     from_gcs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     status_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    from_local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if local_serve is not None else None
     try:
         from_router.bind(listen)
         from_gcs.bind(serve)
+        if from_local is not None:
+            from_local.bind(local_serve)
         router_addr = None
-        peer = None
-        peer_seen = 0.0
+        # Keep the public GCS's latest-client behavior, with an independent
+        # loopback client so WebRTC cannot steal Mission Planner's telemetry.
+        peers = {from_gcs: (None, 0.0)}
+        if from_local is not None:
+            peers[from_local] = (None, 0.0)
         status_sent = None
         status_state = None
         anchored = rewriter.anchor is not None
         if anchored:
             log.info("Lima: anchor loaded")
         while not stop.is_set():
-            ready, _, _ = select.select([from_router, from_gcs], [], [], 0.5)
-            if peer is not None and clock() - peer_seen > PEER_TIMEOUT:
-                log.info("Lima: GCS timed out")
-                peer = None
+            ready, _, _ = select.select([from_router, *peers], [], [], 0.5)
+            for client, (peer, seen) in list(peers.items()):
+                if peer is not None and clock() - seen > PEER_TIMEOUT:
+                    log.info("Lima: %s timed out", "local client" if client is from_local else "GCS")
+                    peers[client] = (None, seen)
             for sock in ready:
                 # On Linux an ICMP port-unreachable from an earlier sendto makes the next
                 # recvfrom raise ConnectionRefusedError; a GCS that is off must not kill us.
@@ -440,27 +454,27 @@ def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic, status=
                 if sock is from_router:
                     router_addr = addr
                     for pkt in rewriter.downlink(data):
-                        if peer is not None:
-                            _send(from_gcs, pkt, peer)
+                        for client, (peer, _seen) in peers.items():
+                            if peer is not None:
+                                _send(client, pkt, peer)
                     anchored = _log_anchor(rewriter, anchored)
                 else:
-                    if allow is not None and addr[0] not in allow:
+                    if sock is from_gcs and allow is not None and addr[0] not in allow:
                         continue
                     out = rewriter.uplink(data)
                     warnings = rewriter.take_warnings()
                     if not (out or warnings):
                         continue
-                    if addr != peer:
-                        log.info("Lima: GCS connected %s:%d", *addr)
-                    peer = addr
-                    peer_seen = clock()
+                    if addr != peers[sock][0]:
+                        log.info("Lima: %s connected", "local client" if sock is from_local else "GCS")
+                    peers[sock] = (addr, clock())
                     for pkt in out:
                         if router_addr is not None:
                             _send(from_router, pkt, router_addr)
                     for w in warnings:
-                        _send(from_gcs, w, peer)
+                        _send(sock, w, addr)
             if status is not None:
-                state = peer is not None
+                state = any(peer is not None for peer, _seen in peers.values())
                 now = clock()
                 if state != status_state or now - status_sent >= STATUS_INTERVAL:
                     _send(status_sock, status_datagram(state, rewriter.fake_anchor), status)
@@ -468,6 +482,8 @@ def run(listen, serve, rewriter, stop, allow=None, clock=time.monotonic, status=
     finally:
         from_router.close()
         from_gcs.close()
+        if from_local is not None:
+            from_local.close()
         status_sock.close()
 
 
@@ -499,6 +515,7 @@ def _parse_km(s):
 def main():
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     serve = _setting("LIMA_SERVE", "0.0.0.0:14551", parse_hostport)
+    local_serve = _setting("LIMA_LOCAL_SERVE", "127.0.0.1:14552", parse_local_hostport)
     allow = _setting("LIMA_GCS_ALLOW", None, parse_ip_list) if "LIMA_GCS_ALLOW" in os.environ else None
     listen = _setting("LIMA_LISTEN", "127.0.0.1:14580", parse_hostport)
     fake_anchor = _setting("LIMA_FAKE_ANCHOR", "-12.0700,-77.0435", parse_latlon)
@@ -509,7 +526,7 @@ def main():
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    run(listen, serve, rewriter, stop, allow=allow, status=status)
+    run(listen, serve, rewriter, stop, allow=allow, status=status, local_serve=local_serve)
 
 
 if __name__ == "__main__":

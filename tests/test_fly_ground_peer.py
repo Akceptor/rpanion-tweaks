@@ -152,6 +152,40 @@ if __name__ == "__main__":
 
 
 class StallTest(unittest.TestCase):
+    def test_plugin_warnings_never_log_turn_credentials_or_raw_debug(self):
+        from fly_ground_peer import GstPeer
+        from unittest.mock import Mock
+        secret = 'turn://relay-user:relay-password@turn.cloudflare.com:3478'
+        warning = SimpleNamespace(message=secret, domain=secret, code=5)
+        msg = SimpleNamespace(type=4, src=SimpleNamespace(get_name=lambda: secret),
+                              parse_warning=lambda: (warning, 'debug ' + secret))
+        gst = SimpleNamespace(MessageType=SimpleNamespace(ERROR=1, EOS=2, WARNING=4, STATE_CHANGED=8))
+        peer = SimpleNamespace(Gst=gst, log_counts=lambda now: None, check_stall=lambda now: None,
+                               now=lambda: 0, bus=SimpleNamespace(timed_pop_filtered=Mock(side_effect=[msg, None])))
+        with self.assertLogs('fly-ground', level='WARNING') as logs:
+            GstPeer.poll_bus(peer)
+        text = ' '.join(logs.output)
+        self.assertNotIn('relay-user', text)
+        self.assertNotIn('relay-password', text)
+        self.assertNotIn('debug', text)
+        self.assertIn('code 5', text)
+
+    def test_plugin_error_exception_exposes_only_safe_category_and_numeric_code(self):
+        from fly_ground_peer import GstPeer
+        from unittest.mock import Mock
+        secret = 'turn://relay-user:relay-password@turn.cloudflare.com:3478'
+        error = SimpleNamespace(message=secret, domain='gst-resource-error-quark', code=5)
+        msg = SimpleNamespace(type=1, parse_error=lambda: (error, secret))
+        gst = SimpleNamespace(MessageType=SimpleNamespace(ERROR=1, EOS=2, WARNING=4, STATE_CHANGED=8))
+        peer = SimpleNamespace(Gst=gst, log_counts=lambda now: None, check_stall=lambda now: None,
+                               now=lambda: 0, bus=SimpleNamespace(timed_pop_filtered=Mock(return_value=msg)))
+        with self.assertRaises(RuntimeError) as cm:
+            GstPeer.poll_bus(peer)
+        self.assertNotIn('relay-user', str(cm.exception))
+        self.assertNotIn('relay-password', str(cm.exception))
+        self.assertIn('resource', str(cm.exception))
+        self.assertIn('code 5', str(cm.exception))
+
     def test_buffer_probe_counts_lists_and_corruption_flags(self):
         from fly_ground_peer import GstPeer
         from unittest.mock import Mock

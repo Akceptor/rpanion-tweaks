@@ -41,6 +41,7 @@ class Settings:
     site_url: str
     rtsp_url: str
     router_url: str
+    monitor_url: str
     channels: tuple[int, ...]
     throttle_channel: int
     gcs_sysid: int
@@ -68,9 +69,12 @@ class Settings:
         state_file = env.get("FLY_VIDEO_STATE_FILE", STATE_FILE)
         if not isinstance(state_file, str) or not Path(state_file).is_absolute():
             raise ValueError("FLY_VIDEO_STATE_FILE must be an absolute path")
-        router = env.get("FLY_MAVLINK", "tcp:127.0.0.1:5760")
-        if not router.startswith("tcp:"):
-            raise ValueError("FLY_MAVLINK must be a TCP pymavlink connection")
+        router = env.get("FLY_MAVLINK", "udpout:127.0.0.1:14552")
+        if not router.startswith(("tcp:", "udpout:")):
+            raise ValueError("FLY_MAVLINK must be a TCP or udpout pymavlink connection")
+        monitor = env.get("FLY_MONITOR", "tcp:127.0.0.1:5760")
+        if not monitor.startswith("tcp:"):
+            raise ValueError("FLY_MONITOR must be a TCP pymavlink connection")
         try:
             channels = tuple(int(x.strip()) for x in env.get("FLY_CHANNELS", "1,3").split(","))
         except ValueError as exc:
@@ -86,6 +90,6 @@ class Settings:
         planner_compid = _int(env, "FLY_PLANNER_COMPID", 190, 1)
         if (gcs_sysid, gcs_compid) == (planner_sysid, planner_compid):
             raise ValueError("Pi and Mission Planner MAVLink source IDs must differ")
-        return cls(code, room_id_for(code), site, rtsp, router, channels, throttle, gcs_sysid,
+        return cls(code, room_id_for(code), site, rtsp, router, monitor, channels, throttle, gcs_sysid,
                    gcs_compid, planner_sysid, planner_compid,
                    _int(env, "FLY_SESSION_SECONDS", 3600, 0, 86400), video_source, state_file)

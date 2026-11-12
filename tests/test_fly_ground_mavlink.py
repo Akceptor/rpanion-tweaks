@@ -69,13 +69,35 @@ class AdapterTest(unittest.TestCase):
         self.adapter.poll(1000)
         self.assertEqual(self.adapter.target, (42, 1))
         self.adapter.send(1000)
-        self.assertEqual(self.writer.mav.heartbeats, [])
+        self.assertEqual(len(self.writer.mav.heartbeats), 1)
         self.assertEqual(self.writer.mav.overrides, [])
         self.drive()
         self.adapter.send(1000)
         self.assertEqual(len(self.writer.mav.heartbeats), 1)
         self.assertEqual(self.writer.mav.overrides[0][:2], (42, 1))
         self.assertEqual(len(self.writer.mav.overrides[0]), 20)
+
+    def test_browser_telemetry_comes_only_from_lima_writer_not_raw_monitor(self):
+        received = []
+        self.adapter.on_telemetry = received.append
+        raw = Message("GLOBAL_POSITION_INT", 42, 1, lat=470000000, lon=80000000)
+        masked = Message("GLOBAL_POSITION_INT", 42, 1, lat=-120700000, lon=-770435000)
+        self.monitor.messages.append(raw)
+        self.writer.messages.append(masked)
+        self.adapter.poll(1000)
+        self.assertEqual(received, [masked])
+
+    def test_idle_connected_browser_registers_lima_before_target_discovery(self):
+        self.adapter.send(1000)
+        self.assertEqual(len(self.writer.mav.heartbeats), 1)
+        self.assertEqual(self.writer.mav.overrides, [])
+        self.adapter.send(1500)
+        self.assertEqual(len(self.writer.mav.heartbeats), 1)
+        self.adapter.send(2000)
+        self.assertEqual(len(self.writer.mav.heartbeats), 2)
+        self.a.peer_connected = False
+        self.adapter.send(3000)
+        self.assertEqual(len(self.writer.mav.heartbeats), 2)
 
     def test_planner_heartbeat_releases_override_before_any_browser_send(self):
         self.drive()

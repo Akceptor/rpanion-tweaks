@@ -1,8 +1,8 @@
 [Unit]
 Description=Fly-by-WebRTC Raspberry Pi Ground bridge
 Wants=network-online.target
-After=network-online.target rpanion-server.service
-Requires=rpanion-server.service
+After=network-online.target rpanion-server.service lima.service
+Requires=rpanion-server.service lima.service
 
 [Service]
 Type=simple

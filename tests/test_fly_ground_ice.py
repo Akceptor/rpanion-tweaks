@@ -1,42 +1,54 @@
-import io
-import json
+"""ICE configuration must arrive from the admitted signaling connection."""
+
+import copy
+from pathlib import Path
 import sys
 import unittest
-from pathlib import Path
-from unittest import mock
-from urllib.error import HTTPError, URLError
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
+from fly_ground_bootstrap import parse_session_ready
 
-from fly_ground import ice_servers
+STUN = {'urls': 'stun:stun.cloudflare.com:3478'}
+TURN = {'urls': 'turn:turn.cloudflare.com:3478?transport=udp', 'username': 'u', 'credential': 'p'}
+NOW = 1_800_000_000_000
 
 
-STUN = [{"urls": "stun:stun.cloudflare.com:3478"}]
+def bootstrap():
+    return dict(type='session-ready', generation='generation-1', iceServers=[STUN, TURN],
+                expiresAt=NOW + 7_140_000, turnStatus='available')
 
 
 class IceServerTest(unittest.TestCase):
-    def test_uses_turn_response_when_available(self):
-        servers = STUN + [{"urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
-                           "username": "user", "credential": "pass"}]
-        with mock.patch("fly_ground.urlopen", return_value=io.BytesIO(json.dumps({"iceServers": servers}).encode())):
-            self.assertEqual(ice_servers("https://site.example"), servers)
+    def test_validates_and_normalizes_admitted_ice_servers(self):
+        value = parse_session_ready(bootstrap(), 'generation-1', NOW)
+        self.assertEqual(value['iceServers'][1]['urls'], [TURN['urls']])
+        self.assertEqual(value['expiresAt'], NOW + 7_140_000)
+        self.assertEqual(value['turnStatus'], 'available')
 
-    def test_falls_back_to_stun_when_turn_endpoint_is_missing(self):
-        error = HTTPError("https://site.example/turn", 404, "Not Found", {}, None)
-        with mock.patch("fly_ground.urlopen", side_effect=error):
-            with self.assertLogs("fly-ground", level="WARNING") as logs:
-                self.assertEqual(ice_servers("https://site.example"), STUN)
-        error.close()
-        self.assertIn("using STUN only", logs.output[0])
+    def test_authorized_stun_only_fallback_is_explicit(self):
+        value = bootstrap()
+        value.update(iceServers=[STUN], turnStatus='unavailable')
+        self.assertEqual(parse_session_ready(value, 'generation-1', NOW)['iceServers'],
+                         [{'urls': [STUN['urls']]}])
 
-    def test_falls_back_to_stun_when_turn_is_unavailable_or_invalid(self):
-        with mock.patch("fly_ground.urlopen", side_effect=URLError("network down")):
-            with self.assertLogs("fly-ground", level="WARNING"):
-                self.assertEqual(ice_servers("https://site.example"), STUN)
-        with mock.patch("fly_ground.urlopen", return_value=io.BytesIO(b"{}")):
-            with self.assertLogs("fly-ground", level="WARNING"):
-                self.assertEqual(ice_servers("https://site.example"), STUN)
+    def test_rejects_wrong_generation_type_or_deadline(self):
+        for update in ({'generation': 'old'}, {'type': 'offer'}, {'expiresAt': NOW},
+                       {'expiresAt': NOW + 7_200_001}, {'expiresAt': float('inf')},
+                       {'expiresAt': True}, {'turnStatus': 'unknown'}):
+            value = bootstrap()
+            value.update(update)
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                parse_session_ready(value, 'generation-1', NOW)
+
+    def test_rejects_invalid_or_uncredentialed_relay_configuration(self):
+        for servers in ([], 'bad', [{'urls': 'https://evil.example'}],
+                        [dict(TURN, credential='')], [dict(TURN, username=1)],
+                        [dict(TURN, urls='turn:host:bad')], [dict(TURN, urls='turn:user:pass@host')],
+                        [STUN], [dict(TURN, urls=[])], [None]):
+            value = bootstrap()
+            value['iceServers'] = copy.deepcopy(servers)
+            with self.subTest(servers=servers), self.assertRaises(ValueError):
+                parse_session_ready(value, 'generation-1', NOW)
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == '__main__': unittest.main()

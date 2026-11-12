@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 from pathlib import Path
 import sys
 import tempfile
@@ -101,20 +103,33 @@ class WaitTest(unittest.IsolatedAsyncioTestCase):
             protocols.append(protocol)
             return peer
 
-        adapter.send.side_effect = lambda _now: released.append(protocols[0].arbiter.take_release())
+        def capture_release(_now):
+            if protocols:
+                release = protocols[0].arbiter.take_release()
+                if release is not None:
+                    released.append(release)
+        adapter.send.side_effect = capture_release
         ws = AsyncMock()
+        ws.recv.side_effect = [
+            json.dumps({'type': 'room-ready', 'generation': 'test'}),
+            json.dumps({'type': 'session-ready', 'generation': 'test',
+                        'expiresAt': time.time() * 1000 + 60000,
+                        'iceServers': [{'urls': 'stun:stun.cloudflare.com:3478'}],
+                        'turnStatus': 'unavailable'})]
+        watcher = Mock()
+        watcher.poll.side_effect = [None, None, video.VideoSourceChanged('changed')]
         context = AsyncMock()
         context.__aenter__.return_value = ws
         with patch.dict(sys.modules, {'gi.repository': SimpleNamespace(GLib=Mock())}), \
-                patch.object(fly_ground, 'ice_servers', return_value=[]), \
+                patch.object(fly_ground, 'SourceWatcher', return_value=watcher), \
                 patch.object(fly_ground, 'mavlink_connections', return_value=(writer, monitor)), \
                 patch.object(fly_ground, 'MavlinkAdapter', return_value=adapter), \
                 patch.object(fly_ground, 'GstPeer', side_effect=make_peer), \
                 patch('websockets.connect', return_value=context):
             with self.assertRaises(video.VideoSourceChanged):
-                await fly_ground.run_session(settings, source)
+                await fly_ground.run_session(settings, "A" * 43, source)
         peer.close.assert_called_once()
-        adapter.send.assert_called_once()
+        self.assertGreaterEqual(adapter.send.call_count, 1)
         writer.close.assert_called_once()
         monitor.close.assert_called_once()
         self.assertEqual((released[0][0], released[0][2]), (0, 0))
@@ -130,5 +145,5 @@ class WaitTest(unittest.IsolatedAsyncioTestCase):
                                  fly_ground.RoomRejected(4001), asyncio.CancelledError()]), \
                 patch.object(fly_ground.asyncio, 'sleep', new_callable=AsyncMock) as sleep:
             with self.assertRaises(asyncio.CancelledError):
-                await fly_ground.run(object())
+                await fly_ground.run(object(), "A" * 43)
         self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 30])

@@ -229,6 +229,8 @@ sudo systemctl enable --now lima
 
 Lima is a UDP server on port 14551, next to Rpanion's own UDP Server on 14550. The Pi never sends to a GCS first: nothing goes out until a GCS sends Lima a packet, and the GCS must connect to the Pi (see below). Lima is a separate service, so Rpanion `.deb` upgrades don't touch it.
 
+Lima also serves one independent local client on `127.0.0.1:14552` for fly-ground. Local and public clients receive the same shifted telemetry without replacing each other. The HUD shows Lima ON while either client is active. Each endpoint retains its latest client and expires it after five seconds without valid traffic.
+
 One-time Rpanion setup, **Flight Controller** page: stop telemetry, add **Telemetry Destinations** → **UDP Client** `127.0.0.1:14580` (keep `14540` and `14570`), start telemetry. Rpanion's UDP/TCP servers can stay as they are.
 
 Then connect the GCS to the Pi (e.g. `10.46.93.18`):
@@ -257,6 +259,7 @@ Set them like the others (`sudo systemctl edit lima`, `Environment=...` lines un
 | Variable | Default | Meaning |
 |---|---|---|
 | `LIMA_SERVE` | `0.0.0.0:14551` | Where Lima listens for the GCS. Replies go to the source of the latest GCS packet |
+| `LIMA_LOCAL_SERVE` | `127.0.0.1:14552` | Independent local client endpoint for WebRTC; must use an IPv4 loopback address |
 | `LIMA_GCS_ALLOW` | unset (any IP) | Comma-separated IPv4 list, e.g. the PC's ZeroTier IP. Packets from other IPs are ignored |
 | `LIMA_STATUS` | `127.0.0.1:14571` | Where Lima sends its once-a-second status for the video HUD (`STATS_LIMA_PORT`): `LIMA <0\|1> <fake_lat> <fake_lon>`, 5 decimals. Deploy Lima and the video-server together: an old HUD rejects this format and shows `Lima: OFF` |
 | `LIMA_LISTEN` | `127.0.0.1:14580` | Where mavlink-router sends to (the Rpanion UDP output) |
@@ -468,7 +471,7 @@ Based on Rpanion Server by Stephen Dade, licensed under GPL-3.0. This modified f
 
 # Fly-by-WebRTC Pi Ground bridge
 
-The `fly-ground` service hosts a browser cockpit session for this Pi. It reads Rpanion's H.264 RTSP feed, sends the same image (including any Rpanion HUD burned into it) over WebRTC, and sends selected browser RC channels to ArduPilot as MAVLink overrides. Mission Planner has priority when its GCS heartbeat is visible on the local mavlink-router monitor. The browser cockpit is served by the fly-by-webrtc site; the Pi service has no separate web UI.
+The `fly-ground` service hosts a browser cockpit session for this Pi. It reads Rpanion's H.264 RTSP feed, sends the same image (including any Rpanion HUD burned into it) over WebRTC, and sends selected browser RC channels to ArduPilot as MAVLink overrides. MAVLink writes and browser telemetry use Lima's local endpoint by default, so position telemetry is shifted consistently with the HUD. Mission Planner has priority when its GCS heartbeat is visible on a separate read-only mavlink-router monitor; raw monitor telemetry never goes to the browser. The browser cockpit is served by the fly-by-webrtc site; the Pi service has no separate web UI.
 
 ## Install (after the Pi is online)
 
@@ -496,7 +499,9 @@ sudo chmod -R a+rX /opt/fly-ground/venv/lib/python*/site-packages
 sudo -u rpanion env PYTHONNOUSERSITE=1 /opt/fly-ground/venv/bin/python -c 'import gi, websockets; from pymavlink.dialects.v20 import ardupilotmega; print("ok")'
 ```
 
-Run those commands from this repository's root. TURN is optional: the Pi and browser use Cloudflare STUN when `/turn` is unavailable. STUN-only sessions depend on a direct WebRTC path and may fail across LTE or restrictive NAT. For reliable internet sessions, configure Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN`; the Pi fetches short-lived credentials from `/turn`, never the long-lived key.
+Run those commands from this repository's root. Configure Worker secrets `TURN_KEY_ID` and `TURN_API_TOKEN` for reliable internet sessions. The Worker issues separate temporary TURN credentials to each admitted peer over signaling; the public `/turn` endpoint no longer issues credentials. If TURN is unavailable, an authorized session may use Cloudflare STUN only, which can fail across LTE or restrictive NAT.
+
+The Pi must authenticate room creation with `FLY_HOST_TOKEN`. After creating the environment file below and installing the settings page, generate a random 32-byte base64url secret (43 characters), configure it as the Worker's `FLY_HOST_TOKEN` secret, and save the same value using **Pi host secret** on the port 4001 settings page. The page stores it in `/etc/fly-ground.env` with mode `0600` and never returns the saved value. Restart the bridge after saving. Keep the secret out of connection links, source control, and command-line arguments. A missing or invalid secret prevents the bridge from starting; a mismatched secret is rejected by the Worker. Browser-hosted Ground sessions are disabled on this Pi-only deployment.
 
 Create one room code and a private environment file. Replace `https://YOUR-SITE` with the actual fly-by-webrtc origin and set the real RTSP URL if different. The command prints the bookmark once; keep it private because the code allows video viewing.
 
@@ -516,9 +521,11 @@ sudo install -o rpanion -g rpanion -m 0600 /tmp/fly-ground.env /etc/fly-ground.e
 rm /tmp/fly-ground.env
 ```
 
-Set `FLY_RTSP_URL=rtsp://...` if needed. Defaults: `FLY_MAVLINK=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. Set `FLY_SESSION_SECONDS=0` only for an intentional unlimited session. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
+Install/update and start Lima first using the instructions above. Defaults: `FLY_MAVLINK=udpout:127.0.0.1:14552`, `FLY_MONITOR=tcp:127.0.0.1:5760`, `FLY_CHANNELS=1,3` (steering and throttle), `FLY_THROTTLE_CHANNEL=3`, `FLY_GCS_SYSID=255`, `FLY_GCS_COMPID=191`, `FLY_PLANNER_SYSID=255`, `FLY_PLANNER_COMPID=190`, `FLY_SESSION_SECONDS=3600`. Existing installations with an explicit `FLY_MAVLINK=tcp:...` keep that direct route until it is changed to the Lima endpoint. `FLY_MONITOR` is used only for priority and target discovery. An accepted browser keeps Lima active with a heartbeat even while its driving controls are idle. Set `FLY_RTSP_URL=rtsp://...` if needed. `FLY_SESSION_SECONDS=0` disables the local duration limit, but the Worker still ends a connection before its temporary relay credentials expire (currently two hours, with a one-minute margin). Rejoin the same link for fresh credentials; no owner-key rotation is required. Default one-hour sessions retain their local limit. Before driving, compare the crawler's `RCMAP_*`, `RCx_MIN/MAX/TRIM`, arm/mode setup, `MAV_GCS_SYSID`, and `MAV_OPTIONS` with these values. Only explicitly listed channels are overridden. The browser requires a fresh neutral throttle packet and an explicit **Resume driving** click for every session.
 
 After the session data channel opens, five seconds without a valid heartbeat reply ends the session and releases its control overrides. The bridge then starts a fresh session so a closed or unreachable browser does not keep the code occupied. This heartbeat timeout also applies when `FLY_SESSION_SECONDS=0`; it is separate from the faster RC-packet watchdog.
+
+Signaling now stays connected throughout media/control use. The Pi sends an owner heartbeat every 20 seconds, and missing acknowledgments for 60 seconds ends the session. Closing signaling ends the connection and releases overrides. The Worker revokes both peers' temporary TURN credentials on session end, retrying failed revocations until success or credential expiry. An invited participant can copy the credentials delivered to their browser and reuse them until revocation takes effect or expiry; possession of the Worker URL alone no longer grants credentials or room creation.
 
 Install and start the unit:
 
@@ -550,6 +557,13 @@ creates and saves a new CRAWLER code. **Restart bridge** is separate: saved
 settings (including a recreated code) take effect only after restart, which ends
 an active session. The page shows the saved code, not proof that the running
 bridge has loaded it.
+
+**Pi host secret** is a separate write-only field. Its status says whether a valid
+secret is configured; it never displays or returns that value. Enter a replacement
+and choose **Save host secret**, then **Restart bridge**. A blank field preserves
+the existing value. Normal settings changes and code recreation also preserve it.
+Use the same value for the Worker's `FLY_HOST_TOKEN` secret. Room-link recipients
+do not need this secret or an extra login.
 
 The service has no login and is intended for the operator's trusted private or
 ZeroTier network. The default bind is `0.0.0.0:4001`; use `--host` with the Pi's

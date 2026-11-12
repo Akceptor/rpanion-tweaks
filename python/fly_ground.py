@@ -7,8 +7,9 @@ import logging
 import os
 import signal
 import time
-from urllib.request import Request, urlopen
 
+from fly_ground_auth import host_token_from_env, validate_host_token
+from fly_ground_bootstrap import HostLease, parse_session_ready
 from fly_ground_config import Settings
 from fly_ground_control import Arbiter
 from fly_ground_mavlink import MavlinkAdapter
@@ -17,15 +18,15 @@ from fly_ground_video import SourceWatcher, VideoSourceChanged, wait_for_source
 
 
 LOG = logging.getLogger("fly-ground")
-STUN_FALLBACK = [{"urls": "stun:stun.cloudflare.com:3478"}]
 # Worker close codes: host already present, room locked/closed, join rate limit.
-ROOM_REJECT_CODES = {4001, 4009, 4029}
+ROOM_REJECT_CODES = {4001, 4009, 4029, 4401}
 REJECT_DELAY = 30
 
 
 class RoomRejected(ConnectionError):
     def __init__(self, code):
-        super().__init__(f"signaling server rejected host (close code {code})")
+        reason = 'host authentication failed; check FLY_HOST_TOKEN' if code == 4401 else 'signaling server rejected host'
+        super().__init__(f"{reason} (close code {code})")
         self.code = code
 
 
@@ -40,26 +41,12 @@ def now_ms():
     return int(time.monotonic() * 1000)
 
 
-def ice_servers(site_url):
-    try:
-        with urlopen(Request(site_url + "/turn", headers={"Accept": "application/json"}), timeout=15) as response:
-            servers = json.load(response)["iceServers"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        LOG.warning("TURN unavailable (%s); using STUN only", type(exc).__name__)
-        return STUN_FALLBACK
-    if isinstance(servers, list) and any(isinstance(server, dict) and server.get("username")
-                                             and server.get("credential") for server in servers):
-        return servers
-    LOG.warning("TURN response has no relay credentials; using STUN only")
-    return STUN_FALLBACK
-
-
 def mavlink_connections(settings):
     from pymavlink import mavutil
     writer = mavutil.mavlink_connection(settings.router_url, source_system=settings.gcs_sysid,
                                        source_component=settings.gcs_compid, dialect="ardupilotmega")
     try:
-        monitor = mavutil.mavlink_connection(settings.router_url, source_system=254,
+        monitor = mavutil.mavlink_connection(settings.monitor_url, source_system=254,
                                             source_component=192, dialect="ardupilotmega")
     except Exception:
         writer.close()
@@ -82,17 +69,18 @@ def log_status(protocol, arbiter, adapter, now):
              "never" if planner is None else f"{(now - planner) / 1000:.1f}s ago")
 
 
-async def run_session(settings, source):
+async def run_session(settings, host_token, source=None):
+    validate_host_token(host_token)
+    if source is None:
+        source = await wait_for_source(settings)
     import websockets
     from gi.repository import GLib
 
-    servers = await asyncio.to_thread(ice_servers, settings.site_url)
     writer, monitor = await asyncio.to_thread(mavlink_connections, settings)
     arbiter = Arbiter(settings.channels, settings.throttle_channel)
     outgoing = asyncio.Queue(maxsize=64)
     loop = asyncio.get_running_loop()
     peer = None
-    ws = None
     closed = False
 
     def queue_signal(obj):
@@ -113,24 +101,38 @@ async def run_session(settings, source):
     adapter = MavlinkAdapter(writer, monitor, arbiter, settings,
                              on_telemetry=lambda msg: send_session(telemetry_message(msg)))
     try:
-        async with websockets.connect(signal_url(settings), max_size=65536, open_timeout=15) as ws:
-            peer = GstPeer(source, servers, queue_signal, protocol, on_closed)
+        async with websockets.connect(signal_url(settings), max_size=65536, open_timeout=15,
+                                      additional_headers={'Authorization': 'Bearer ' + host_token}) as ws:
             watcher = SourceWatcher(settings, source)
             last_ping = last_state = last_status = now_ms()
-            signal_open = True
+            lease = HostLease(last_ping)
+            session_deadline = None
             connecting_at = None
+            connected_sent = False
+            offered = False
             context = GLib.MainContext.default()
             while not closed and not protocol.ended:
                 now = now_ms()
                 watcher.poll(now)
+                lease.check(now)
+                heartbeat = lease.heartbeat(now)
+                if heartbeat is not None:
+                    await ws.send(json.dumps(heartbeat, separators=(',', ':')))
+                if session_deadline is not None and now >= session_deadline:
+                    protocol.close(now, 'relay authorization expired; reconnect')
+                    break
                 for _ in range(20):
                     if not context.pending():
                         break
                     context.iteration(False)
-                peer.poll_bus()
+                if peer is not None:
+                    peer.poll_bus()
                 adapter.poll(now)
                 protocol.tick(now)
                 adapter.send(now)
+                if protocol.started_ms is not None and not connected_sent:
+                    await ws.send(json.dumps({'type': 'rtc-connected', 'generation': lease.generation}))
+                    connected_sent = True
                 if protocol.started_ms is not None and now - last_status >= 5000:
                     last_status = now
                     log_status(protocol, arbiter, adapter, now)
@@ -140,36 +142,48 @@ async def run_session(settings, source):
                 if protocol.started_ms is not None and now - last_state >= 1000:
                     protocol.state(now)
                     last_state = now
-                while signal_open and not outgoing.empty():
+                while not outgoing.empty():
                     await ws.send(json.dumps(outgoing.get_nowait(), separators=(",", ":")))
-                if signal_open:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=.02)
-                        msg = json.loads(raw)
-                        if msg.get("type") != "ice":
-                            LOG.info("Signal: %s", msg.get("type"))
-                        if msg.get("type") == "peer-joined":
-                            connecting_at = now_ms()
-                            peer.offer()
-                        else:
-                            peer.on_signal(msg)
-                    except asyncio.TimeoutError:
-                        pass
-                    except websockets.ConnectionClosed as exc:
-                        code = getattr(exc.rcvd, "code", None)
-                        LOG.info("Signaling closed: %s %s", code, getattr(exc.rcvd, "reason", ""))
-                        signal_open = False
-                        if connecting_at is None and code in ROOM_REJECT_CODES:
-                            raise RoomRejected(code) from None
-                    except (ValueError, TypeError, KeyError) as exc:
-                        LOG.warning("Invalid signaling message: %s", type(exc).__name__)
-                else:
-                    await asyncio.sleep(.02)
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=.02)
+                    msg = json.loads(raw)
+                    if not isinstance(msg, dict):
+                        raise ValueError('Invalid signaling message')
+                    kind = msg.get('type')
+                    if kind == 'room-ready':
+                        lease.admit(msg.get('generation'), now_ms())
+                    elif kind == 'host-heartbeat-ack':
+                        lease.ack(msg.get('generation'), now_ms())
+                    elif kind == 'session-ready':
+                        if peer is not None:
+                            raise ValueError('Duplicate admitted session configuration')
+                        epoch = time.time() * 1000
+                        bootstrap = parse_session_ready(msg, lease.generation, epoch)
+                        connecting_at = now_ms()
+                        session_deadline = connecting_at + bootstrap['expiresAt'] - epoch
+                        peer = GstPeer(source, bootstrap['iceServers'], queue_signal, protocol, on_closed)
+                        if bootstrap['turnStatus'] == 'unavailable':
+                            LOG.warning('Authorized session has no TURN relay; using STUN only')
+                        await ws.send(json.dumps({'type': 'rtc-ready', 'generation': lease.generation}))
+                    elif kind == 'peer-joined':
+                        if peer is None or offered:
+                            raise ValueError('Unexpected negotiation start')
+                        offered = True
+                        peer.offer()
+                    elif kind in ('answer', 'ice'):
+                        if peer is None:
+                            raise ValueError('Signaling arrived before admitted session configuration')
+                        peer.on_signal(msg)
+                except asyncio.TimeoutError:
+                    pass
+                except websockets.ConnectionClosed as exc:
+                    code = getattr(exc.rcvd, 'code', None)
+                    LOG.info('Signaling closed (code %s)', code)
+                    if code in ROOM_REJECT_CODES:
+                        raise RoomRejected(code) from None
+                    raise ConnectionError('Signaling closed; ending session') from None
                 if protocol.started_ms is None and connecting_at is not None and now - connecting_at > 60_000:
                     raise TimeoutError("WebRTC peer did not connect")
-                # The browser drops signaling once ICE connects, which can precede the data channel opening.
-                if not signal_open and protocol.started_ms is None and connecting_at is None:
-                    raise ConnectionError("signaling closed before WebRTC connected")
     finally:
         protocol.close(now_ms())
         if peer is not None:
@@ -182,12 +196,12 @@ async def run_session(settings, source):
         monitor.close()
 
 
-async def run(settings):
+async def run(settings, host_token):
     delay = 1
     while True:
         try:
             source = await wait_for_source(settings)
-            await run_session(settings, source)
+            await run_session(settings, host_token, source)
             wait, delay = 1, 1
         except asyncio.CancelledError:
             raise
@@ -198,18 +212,19 @@ async def run(settings):
             LOG.warning("%s; retrying in %ss", exc, REJECT_DELAY)
             wait, delay = next_delay(delay, exc)
         except Exception as exc:
-            LOG.exception("Session stopped (%s): %s", type(exc).__name__, exc)
+            # Exception text can include transport details; never log bearer headers or ICE credentials.
+            LOG.warning("Session stopped (%s)", type(exc).__name__)
             wait, delay = next_delay(delay, exc)
         await asyncio.sleep(wait)
 
 
-async def serve(settings):
+async def serve(settings, host_token):
     # systemd stops with SIGTERM; cancelling lets run_session's finally release RC overrides
     # and close the websocket, so the worker does not keep a stale host socket.
     task = asyncio.current_task()
     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
     try:
-        await run(settings)
+        await run(settings, host_token)
     except asyncio.CancelledError:
         LOG.info("Stopped")
 
@@ -217,7 +232,11 @@ async def serve(settings):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     settings = Settings.from_env(os.environ)
-    asyncio.run(serve(settings))
+    try:
+        host_token = host_token_from_env(os.environ)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    asyncio.run(serve(settings, host_token))
 
 
 if __name__ == "__main__":

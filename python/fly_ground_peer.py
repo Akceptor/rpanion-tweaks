@@ -39,6 +39,21 @@ def answer_media_summary(sdp):
     return " | ".join(line.strip() for line in sdp.splitlines() if line.startswith(keep))
 
 
+def gst_error_category(error):
+    """Plugin diagnostic text can contain credential-bearing URLs; allowlist metadata."""
+    categories = {
+        'gst-resource-error-quark': 'resource', 'gst-stream-error-quark': 'stream',
+        'gst-core-error-quark': 'core', 'gst-library-error-quark': 'library',
+        'gst-webrtc-error-quark': 'WebRTC', 'gst-sdp-error-quark': 'SDP',
+        'nice-error-quark': 'ICE',
+    }
+    domain = getattr(error, 'domain', None)
+    category = categories.get(domain, 'unknown') if isinstance(domain, str) else 'unknown'
+    code = getattr(error, 'code', None)
+    code = code if type(code) is int and 0 <= code <= 65535 else 'unknown'
+    return f'{category} code {code}'
+
+
 PONG_WINDOW = 6
 CLOCK_SAMPLES = 10
 HEARTBEAT_TIMEOUT_MS = 5000
@@ -263,7 +278,7 @@ class GstPeer:
         offer = reply.get_value("offer") if reply is not None and reply.has_field("offer") else None
         if offer is None or offer.sdp is None:
             error = reply.get_value("error") if reply is not None and reply.has_field("error") else None
-            LOG.error("create-offer failed: %s", error.message if error is not None else reply)
+            LOG.error("create-offer failed (%s)", gst_error_category(error))
             self.loop.call_soon_threadsafe(self.on_closed)
             return
         self.webrtc.emit("set-local-description", offer, self.Gst.Promise.new())
@@ -314,7 +329,7 @@ class GstPeer:
     def _remote_set(self, promise, *_user_data):
         reply = promise.get_reply()
         if reply is not None and reply.has_field("error"):
-            LOG.error("set-remote-description failed: %s", reply.get_value("error").message)
+            LOG.error("set-remote-description failed (%s)", gst_error_category(reply.get_value("error")))
         else:
             LOG.info("Remote description applied")
 
@@ -337,8 +352,8 @@ class GstPeer:
             if msg is None:
                 break
             if msg.type == Gst.MessageType.WARNING:
-                warning, debug = msg.parse_warning()
-                LOG.warning("GStreamer %s: %s (%s)", msg.src.get_name(), warning.message, debug)
+                warning, _debug = msg.parse_warning()
+                LOG.warning("GStreamer warning (%s)", gst_error_category(warning))
                 continue
             if msg.type == Gst.MessageType.STATE_CHANGED:
                 if msg.src == self.pipeline:
@@ -347,7 +362,7 @@ class GstPeer:
                 continue
             if msg.type == self.Gst.MessageType.ERROR:
                 error, _debug = msg.parse_error()
-                raise RuntimeError(f"GStreamer: {error.message}")
+                raise RuntimeError(f"GStreamer error ({gst_error_category(error)})")
             raise RuntimeError("Video input ended")
 
     def close(self):
