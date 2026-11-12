@@ -6,7 +6,7 @@
 
 import argparse
 import signal
-from video_stream_state import (StatePublisher, VideoSource, configure_rtp_sink,
+from video_stream_state import (StatePublisher, VideoSource,
     effective_codec, mount_name, port_number, rtp_destinations)
 import platform
 import ipaddress
@@ -19,6 +19,7 @@ import json
 import tempfile
 import threading
 import socket
+import secrets
 import struct
 import fcntl
 import gi
@@ -916,7 +917,8 @@ def attach_stats(pipeline):
     return GLib.timeout_add(1000, tick)
 
 
-def getPipeline(device, height, width, bitrate, format, rotation, framerate, timestamp, compression) -> str:
+def getPipeline(device, height, width, bitrate, format, rotation, framerate, timestamp, compression,
+                *, payload=True) -> str:
     pipeline: List[str] = []
 
     # -1 is no framerate specified
@@ -927,7 +929,7 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
 
     # start with device
     if device == "testsrc":
-        pipeline.append("videotestsrc pattern=ball")
+        pipeline.append("videotestsrc is-live=true pattern=ball")
         pipeline.append("video/x-raw,width={0},height={1}{2}".format(width, height, framestr))
     elif device.startswith("rtsp://"):
         # rtsp streaming source
@@ -1080,16 +1082,16 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
 
         # final rtp formatting
         pipeline.append("queue")
-        if compression == "H264":
+        if payload and compression == "H264":
             pipeline.append("rtph264pay config-interval=1 name=pay0 pt=96")
-        elif compression == "H265":
+        elif payload and compression == "H265":
             pipeline.append("rtph265pay config-interval=1 name=pay0 pt=96")
     else:
         # just need to do rtp payloader for pre-compressed streams
         pipeline.append("queue")
-        if format == "video/x-h264":
+        if payload and format == "video/x-h264":
             pipeline.append("rtph264pay config-interval=1 name=pay0 pt=96")
-        elif format == "video/x-h265":
+        elif payload and format == "video/x-h265":
             pipeline.append("rtph265pay config-interval=1 name=pay0 pt=96")
 
     # return as full string
@@ -1188,15 +1190,35 @@ def describe_video(args, local_port):
 
 def build_rtp_pipeline(args, local_port):
     destinations = rtp_destinations(args.udp, local_port)
-    chain = getPipeline(args.videosource, args.height, args.width, args.bitrate,
-                        args.format, args.rotation, args.fps, args.timestamp, args.compression)
-    kind = "multiudpsink" if local_port is not None else "udpsink"
-    pipeline = Gst.parse_launch(chain + " ! " + kind + " name=output")
-    sink = pipeline.get_by_name("output")
-    if local_port is not None:
-        configure_rtp_sink(sink, destinations)
+    options = (args.videosource, args.height, args.width, args.bitrate,
+               args.format, args.rotation, args.fps, args.timestamp, args.compression)
+    if len(destinations) > 1:
+        codec = effective_codec(args.format, args.compression).lower()
+        chain = getPipeline(*options, payload=False)
+        # Split complete encoded access units. Each queue/socket can stall alone;
+        # dropping here never discards individual RTP fragments of a frame.
+        branch = ('queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 '
+                  'leaky=downstream ! rtp' + codec + 'pay config-interval=1 pt=96')
+        pipeline = Gst.parse_launch(
+            chain + ' ! ' + codec + 'parse ! video/x-' + codec + ',alignment=au '
+            '! tee name=fanout '
+            'fanout. ! ' + branch + ' name=remote_pay ! udpsink name=output sync=false async=false '
+            'fanout. ! ' + branch + ' name=pay0 ! udpsink name=local_output sync=false async=false')
+        # Preserve identical RTP headers while both branches are healthy. After
+        # a branch drops whole frames, its sequence counter advances independently.
+        offsets = {'ssrc': secrets.randbelow(2**32 - 1),
+                   'timestamp-offset': secrets.randbelow(2**32 - 1),
+                   'seqnum-offset': secrets.randbelow(2**16)}
+        for name in ('remote_pay', 'pay0'):
+            for prop, value in offsets.items():
+                pipeline.get_by_name(name).set_property(prop, value)
+        sinks = ('output', 'local_output')
     else:
-        host, port = destinations[0]
+        chain = getPipeline(*options)
+        pipeline = Gst.parse_launch(chain + ' ! udpsink name=output')
+        sinks = ('output',)
+    for name, (host, port) in zip(sinks, destinations):
+        sink = pipeline.get_by_name(name)
         sink.set_property("host", host)
         sink.set_property("port", port)
         if is_multicast(host):

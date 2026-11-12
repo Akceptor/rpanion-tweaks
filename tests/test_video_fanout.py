@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import socket
 import sys
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -20,7 +21,7 @@ try:
     Gst.init(None)
     HAVE_GST = all(Gst.ElementFactory.find(name) for name in (
         'x264enc', 'videotestsrc', 'rtph264pay', 'rtph264depay', 'h264parse',
-        'multiudpsink', 'udpsrc', 'rtpjitterbuffer', 'appsink'))
+        'udpsink', 'udpsrc', 'rtpjitterbuffer', 'appsink'))
 except (ImportError, ValueError):
     Gst = None
     HAVE_GST = False
@@ -45,10 +46,11 @@ class FanoutTest(unittest.TestCase):
         args = SimpleNamespace(videosource='testsrc', height=96, width=128, bitrate=200,
             format='video/x-raw', rotation=0, fps=25, timestamp=False, compression='H264',
             udp=f'{remote_host}:{remote_port}')
-        camera = ('videotestsrc is-live=true ! video/x-raw,width=128,height=96,framerate=25/1 '
-                  '! x264enc tune=zerolatency key-int-max=10 '
-                  '! rtph264pay config-interval=1 pt=96')
-        with patch.object(self.server, 'getPipeline', return_value=camera):
+        camera = ('videotestsrc is-live=true pattern=snow ! video/x-raw,width=128,height=96,framerate=25/1 '
+                  '! x264enc tune=zerolatency bitrate=500 key-int-max=10')
+        def source(*_args, payload=True):
+            return camera + (' ! rtph264pay config-interval=1 name=pay0 pt=96' if payload else '')
+        with patch.object(self.server, 'getPipeline', side_effect=source):
             pipeline = self.server.build_rtp_pipeline(args, local_port)
         self.addCleanup(pipeline.set_state, Gst.State.NULL)
         self.assertNotEqual(pipeline.set_state(Gst.State.PLAYING), Gst.StateChangeReturn.FAILURE)
@@ -78,10 +80,105 @@ class FanoutTest(unittest.TestCase):
         error = pipeline.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR)
         self.assertIsNone(error)
 
+    def test_production_synthetic_source_keeps_wall_clock_frame_rate(self):
+        remote, local = self.receiver(), self.receiver()
+        args = SimpleNamespace(videosource='testsrc', height=96, width=128, bitrate=200,
+            format='video/x-raw', rotation=0, fps=25, timestamp=False, compression='H264',
+            udp=f'127.0.0.1:{remote.getsockname()[1]}')
+        with patch.object(self.server, 'is_pi_5_or_later', return_value=False):
+            pipeline = self.server.build_rtp_pipeline(args, local.getsockname()[1])
+        self.addCleanup(pipeline.set_state, Gst.State.NULL)
+        pipeline.set_state(Gst.State.PLAYING)
+        started, frames = time.monotonic(), 0
+        while time.monotonic() - started < 1.1:
+            packet = local.recv(65535)
+            frames += bool(packet[1] & 0x80)
+        self.assertGreaterEqual(frames, 20)
+        self.assertLessEqual(frames, 32, 'synthetic source ran faster than its configured frame rate')
+
     def test_unreachable_remote_does_not_stop_local(self):
         local = self.receiver()
         pipeline = self.sender(5600, local.getsockname()[1], '192.0.2.1')
         self.assertEqual(local.recv(65535)[0] >> 6, 2)
+        self.assertIsNone(pipeline.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR))
+
+    def test_blocked_remote_keeps_local_at_camera_frame_rate(self):
+        self.assert_blocked_output_isolated('output', 'local_output')
+
+    def test_blocked_local_keeps_remote_at_camera_frame_rate(self):
+        self.assert_blocked_output_isolated('local_output', 'output')
+
+    def assert_blocked_output_isolated(self, blocked_name, healthy_name):
+        remote, local = self.receiver(), self.receiver()
+        pipeline = self.sender(remote.getsockname()[1], local.getsockname()[1])
+        remote.recv(65535)
+        local.recv(65535)
+        receivers = {'output': remote, 'local_output': local}
+        healthy = receivers[healthy_name]
+        pad = pipeline.get_by_name(blocked_name).get_static_pad('sink')
+        blocked = threading.Event()
+
+        def hold_remote(_pad, _info):
+            blocked.set()
+            return Gst.PadProbeReturn.OK
+
+        probe = pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, hold_remote)
+        self.addCleanup(pad.remove_probe, probe)
+        self.assertTrue(blocked.wait(2), 'remote branch did not enter the blocked send')
+        healthy.settimeout(.1)
+        started = time.monotonic()
+        frames = []
+        while time.monotonic() - started < 2:
+            try:
+                packet = healthy.recv(65535)
+            except socket.timeout:
+                continue
+            if packet[1] & 0x80:
+                frames.append(time.monotonic())
+        self.assertGreaterEqual(len(frames), 40, 'blocked remote stalled local video')
+        self.assertLess(max(b - a for a, b in zip(frames, frames[1:])), .15)
+        self.assertIsNone(pipeline.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR))
+
+    def test_slow_remote_drops_whole_frames_and_preserves_fragments(self):
+        remote, local = self.receiver(), self.receiver()
+        pipeline = self.sender(remote.getsockname()[1], local.getsockname()[1])
+        # Slow each complete AU before packetization, forcing its branch queue
+        # to drop frames. Record and check the real UDP fragment stream.
+        pad = pipeline.get_by_name('remote_pay').get_static_pad('sink')
+        def slow(_pad, _info):
+            time.sleep(.12)
+            return Gst.PadProbeReturn.OK
+        probe = pad.add_probe(Gst.PadProbeType.BUFFER, slow)
+        self.addCleanup(pad.remove_probe, probe)
+        remote.settimeout(.3)
+        started = time.monotonic()
+        packets = []
+        while time.monotonic() - started < 2:
+            try:
+                packets.append(remote.recv(65535))
+            except socket.timeout:
+                continue
+        # Ignore the last frame if capture ended during a send.
+        markers = [i for i, p in enumerate(packets) if p[1] & 0x80]
+        self.assertGreater(len(markers), 5)
+        self.assertLess(len(markers), 40, 'remote branch did not experience backpressure')
+        complete = packets[:markers[-1] + 1]
+        timestamps = [int.from_bytes(packets[i][4:8], 'big') for i in markers]
+        self.assertTrue(any((b-a) % 2**32 > 7200 for a, b in zip(timestamps, timestamps[1:])))
+        sequence = [int.from_bytes(p[2:4], 'big') for p in complete]
+        self.assertTrue(all((b-a) % 65536 == 1 for a, b in zip(sequence, sequence[1:])),
+                        'RTP packets were discarded after fragmentation')
+        fragments = [p[13] for p in complete if p[12] & 31 == 28]
+        self.assertGreater(len(fragments), 0, 'test must exercise fragmented H264')
+        open_fragment = False
+        for header in fragments:
+            if header & 0x80:
+                self.assertFalse(open_fragment, 'previous fragmented NAL was truncated')
+                open_fragment = True
+            self.assertTrue(open_fragment, 'fragmented NAL is missing its start')
+            if header & 0x40:
+                open_fragment = False
+        self.assertFalse(open_fragment, 'fragmented NAL is missing its end')
         self.assertIsNone(pipeline.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR))
 
     def test_rtp_input_depayloads_late_joined_video(self):
