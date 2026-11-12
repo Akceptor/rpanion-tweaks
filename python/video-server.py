@@ -5,6 +5,9 @@
 # gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/video latency=0 ! decodebin ! autovideosink
 
 import argparse
+import signal
+from video_stream_state import (StatePublisher, VideoSource, configure_rtp_sink,
+    effective_codec, mount_name, port_number, rtp_destinations)
 import platform
 import ipaddress
 from typing import List
@@ -1150,20 +1153,105 @@ class GstServer():
         f.set_clock(None)  # Use default system clock
 
         m = self.server.get_mount_points()
-        if not device.startswith("rtsp://"):
-            name = ''.join(filter(str.isalnum, device))
-        else:
-            # remove any rtsp username or passwords, format rtsp://admin:admin@192.168.1.217:554/11
-            if "@" in device:
-                name = device.split('@')[1]
-            else:
-                name = device.replace("rtsp://", "")
-            name = ''.join(filter(str.isalnum, name))
+        name = mount_name(device)
         m.add_factory("/" + name, f)
 
         print("Added " + "rtsp://<IP>:8554/" + name)
         print("Use: gst-launch-1.0 rtspsrc location=rtsp://<IP>:8554/" +
               name + " latency=0 ! queue ! decodebin ! autovideosink sync=false")
+
+
+def video_options(args, env):
+    local = env.get("RPANION_WEBRTC_RTP_PORT")
+    local = None if local is None else port_number(local)
+    path = env.get("RPANION_VIDEO_STATE_FILE")
+    if path is not None and (not path or not os.path.isabs(path)):
+        raise ValueError("RPANION_VIDEO_STATE_FILE must be an absolute path")
+    if args.multirtsp:
+        if path:
+            print("Automatic video following is unsupported for multirtsp", flush=True)
+        return local, None
+    if args.transport == "RTP":
+        rtp_destinations(args.udp, local)  # Validate before starting the camera.
+        if path and local is None:
+            raise ValueError("RTP state publication requires RPANION_WEBRTC_RTP_PORT")
+    return local, path
+
+
+def describe_video(args, local_port):
+    codec = effective_codec(args.format, args.compression)
+    if args.transport == "RTP":
+        return VideoSource("pending", "RTP", codec, "127.0.0.1", local_port)
+    return VideoSource("pending", "RTSP", codec,
+                       rtsp_url="rtsp://127.0.0.1:8554/" + mount_name(args.videosource))
+
+
+def build_rtp_pipeline(args, local_port):
+    destinations = rtp_destinations(args.udp, local_port)
+    chain = getPipeline(args.videosource, args.height, args.width, args.bitrate,
+                        args.format, args.rotation, args.fps, args.timestamp, args.compression)
+    kind = "multiudpsink" if local_port is not None else "udpsink"
+    pipeline = Gst.parse_launch(chain + " ! " + kind + " name=output")
+    sink = pipeline.get_by_name("output")
+    if local_port is not None:
+        configure_rtp_sink(sink, destinations)
+    else:
+        host, port = destinations[0]
+        sink.set_property("host", host)
+        sink.set_property("port", port)
+        if is_multicast(host):
+            sink.set_property("auto-multicast", True)
+    return pipeline
+
+
+def run_video(loop, pipeline=None, publisher=None):
+    """Own the GLib timers, state publication and RTP pipeline until shutdown."""
+    timers, errors = [], []
+
+    def stop():
+        loop.quit()
+        return False
+
+    def refresh():
+        try:
+            return True if publisher.refresh() else stop()
+        except OSError as exc:
+            errors.append(exc)
+            return stop()
+
+    def poll_bus():
+        bus = pipeline.get_bus()
+        message = bus.timed_pop_filtered(0, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+        if message is None:
+            return True
+        if message.type == Gst.MessageType.ERROR:
+            errors.append(RuntimeError(message.parse_error()[0].message))
+        return stop()
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            timers.append(GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum, stop))
+        if pipeline is not None:
+            attach_stats(pipeline)
+            if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("RTP pipeline failed to start")
+            timers.append(GLib.timeout_add(200, poll_bus))
+        if publisher is not None:
+            publisher.refresh()  # Configuration/permissions errors fail visibly at startup.
+            timers.append(GLib.timeout_add_seconds(1, refresh))
+        loop.run()
+        if errors:
+            raise errors[0]
+    finally:
+        for timer in timers:
+            # A callback returning False already removed its own source.
+            source = GLib.MainContext.default().find_source_by_id(timer)
+            if source is not None:
+                source.destroy()
+        if pipeline is not None:
+            pipeline.set_state(Gst.State.NULL)
+        if publisher is not None:
+            publisher.close()
 
 
 if __name__ == '__main__':
@@ -1191,77 +1279,41 @@ if __name__ == '__main__':
                         default=False, action='store_true')
     args = parser.parse_args()
 
+    try:
+        local_port, state_path = video_options(args, os.environ)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     loop = GLib.MainLoop()
     Gst.init(None)
-
     Gst.debug_set_active(True)
     Gst.debug_set_default_threshold(3)
 
-    # Started here, not on the first RTSP viewer, so battery 2 reaches the GCS even when no one watches the video
+    # Start independently of viewers, so battery 2 reaches the GCS without video.
     SystemStats.get()
-
-    if args.multirtsp != "":
-        # Multi-camera streaming, delimited via ';'
-        # Example commandline is:
-        # ./video-server.py --multirtsp="/dev/video0,480,640,2000,video/x-raw,0,10;/dev/video2,480,640,2000,video/x-raw,0,10"
-
-        cams = args.multirtsp.split(';')
+    pipeline = None
+    publisher = None
+    if args.multirtsp:
         s = GstServer()
-
-        # Add each camera
-        for cam in cams:
-            try:
-                (videosource, height, width, bitrate, formatstr,
-                 rotation, fps, timestamp) = cam.split(',')
-            except:
-                print("Bad format: " + cam)
-                break
-            if not (height.isdigit() and width.isdigit() and bitrate.isdigit() and rotation.isdigit() and fps.isdigit()):
-                print("Bad format: " + cam)
-                break
-            s.addStream(videosource, height, width, bitrate,
-                        formatstr, rotation, fps, timestamp, args.compression)
-
-        try:
-            loop.run()
-        except:
-            print("Exiting RTSP Server")
-            loop.quit()
+        for cam in args.multirtsp.split(';'):
+            fields = cam.split(',')
+            if len(fields) != 8:
+                parser.error("Bad multi-camera format")
+            videosource, height, width, bitrate, formatstr, rotation, fps, timestamp = fields
+            if not all(value.isdigit() for value in (height, width, bitrate, rotation, fps)):
+                parser.error("Bad multi-camera numeric value")
+            s.addStream(videosource, height, width, bitrate, formatstr, rotation, fps,
+                        timestamp, args.compression)
     elif args.transport == "RTSP":
-        # RTSP
         s = GstServer()
         s.addStream(args.videosource, args.height, args.width, args.bitrate,
                     args.format, args.rotation, args.fps, args.timestamp, args.compression)
+    else:
+        pipeline = build_rtp_pipeline(args, local_port)
+        print("Server sending UDP stream to " + args.udp, flush=True)
+        if local_port is not None:
+            print("WebRTC local RTP copy on 127.0.0.1:" + str(local_port), flush=True)
 
-        try:
-            loop.run()
-        except:
-            print("Exiting RTSP Server")
-            loop.quit()
-    elif args.transport == "RTP":
-        # RTP
-        pipeline_str = getPipeline(args.videosource, args.height, args.width,
-                                   args.bitrate, args.format, args.rotation, args.fps, args.timestamp,
-                                   args.compression)
-        pipeline_str += " ! udpsink host={0} port={1}".format(
-            args.udp.split(':')[0], args.udp.split(':')[1])
-        if is_multicast(args.udp.split(':')[0]):
-            pipeline_str += " auto-multicast=true"
-        pipeline = Gst.parse_launch(pipeline_str)
-        attach_stats(pipeline)
-        pipeline.set_state(Gst.State.PLAYING)
-
-        print("Server sending UDP stream to " + args.udp)
-        if args.compression == "H264" or (args.videosource.startswith("rtsp://") and args.format == "video/x-h264"):
-            print(
-                "Use: gst-launch-1.0 udpsrc port={0} caps='application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264' ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false".format(args.udp.split(':')[1]))
-        elif args.compression == "H265" or (args.videosource.startswith("rtsp://") and args.format == "video/x-h265"):
-            print(
-                "Use: gst-launch-1.0 udpsrc port={0} caps='application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H265' ! rtpjitterbuffer ! rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! autovideosink sync=false".format(args.udp.split(':')[1]))
-
-        try:
-            loop.run()
-        except:
-            print("Exiting UDP Server")
-            pipeline.set_state(Gst.State.NULL)
-            loop.quit()
+    if state_path:
+        publisher = StatePublisher(state_path, describe_video(args, local_port))
+    run_video(loop, pipeline, publisher)

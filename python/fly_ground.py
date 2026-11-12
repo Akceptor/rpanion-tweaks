@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended Pi Ground: Rpanion RTSP to WebRTC, browser RC to MAVLink."""
+"""Unattended Pi Ground: Rpanion RTP/RTSP to WebRTC, browser RC to MAVLink."""
 
 import asyncio
 import json
@@ -14,6 +14,7 @@ from fly_ground_config import Settings
 from fly_ground_control import Arbiter
 from fly_ground_mavlink import MavlinkAdapter
 from fly_ground_peer import GstPeer, PeerProtocol, signal_url
+from fly_ground_video import SourceWatcher, VideoSourceChanged, wait_for_source
 
 
 LOG = logging.getLogger("fly-ground")
@@ -68,8 +69,10 @@ def log_status(protocol, arbiter, adapter, now):
              "never" if planner is None else f"{(now - planner) / 1000:.1f}s ago")
 
 
-async def run_session(settings, host_token):
+async def run_session(settings, host_token, source=None):
     validate_host_token(host_token)
+    if source is None:
+        source = await wait_for_source(settings)
     import websockets
     from gi.repository import GLib
 
@@ -100,6 +103,7 @@ async def run_session(settings, host_token):
     try:
         async with websockets.connect(signal_url(settings), max_size=65536, open_timeout=15,
                                       additional_headers={'Authorization': 'Bearer ' + host_token}) as ws:
+            watcher = SourceWatcher(settings, source)
             last_ping = last_state = last_status = now_ms()
             lease = HostLease(last_ping)
             session_deadline = None
@@ -109,6 +113,7 @@ async def run_session(settings, host_token):
             context = GLib.MainContext.default()
             while not closed and not protocol.ended:
                 now = now_ms()
+                watcher.poll(now)
                 lease.check(now)
                 heartbeat = lease.heartbeat(now)
                 if heartbeat is not None:
@@ -156,7 +161,7 @@ async def run_session(settings, host_token):
                         bootstrap = parse_session_ready(msg, lease.generation, epoch)
                         connecting_at = now_ms()
                         session_deadline = connecting_at + bootstrap['expiresAt'] - epoch
-                        peer = GstPeer(settings.rtsp_url, bootstrap['iceServers'], queue_signal, protocol, on_closed)
+                        peer = GstPeer(source, bootstrap['iceServers'], queue_signal, protocol, on_closed)
                         if bootstrap['turnStatus'] == 'unavailable':
                             LOG.warning('Authorized session has no TURN relay; using STUN only')
                         await ws.send(json.dumps({'type': 'rtc-ready', 'generation': lease.generation}))
@@ -195,10 +200,14 @@ async def run(settings, host_token):
     delay = 1
     while True:
         try:
-            await run_session(settings, host_token)
+            source = await wait_for_source(settings)
+            await run_session(settings, host_token, source)
             wait, delay = 1, 1
         except asyncio.CancelledError:
             raise
+        except VideoSourceChanged as exc:
+            LOG.info("%s; following current source", exc)
+            wait, delay = 1, 1
         except RoomRejected as exc:
             LOG.warning("%s; retrying in %ss", exc, REJECT_DELAY)
             wait, delay = next_delay(delay, exc)

@@ -223,5 +223,5 @@ class StallTest(unittest.TestCase):
         peer.counts["depay"] = 10
         GstPeer.check_stall(peer, 4000)
         GstPeer.check_stall(peer, 9000)
-        with self.assertRaisesRegex(RuntimeError, "RTSP stalled"):
+        with self.assertRaisesRegex(RuntimeError, "Video input stalled"):
             GstPeer.check_stall(peer, 9001)

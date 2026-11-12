@@ -9,13 +9,13 @@ import time
 import unittest
 from unittest import mock
 
-for name in ("gi", "gi.repository"):
-    sys.modules.setdefault(name, mock.MagicMock())
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 _path = os.path.join(os.path.dirname(__file__), "..", "python", "video-server.py")
 _spec = importlib.util.spec_from_file_location("video_server", _path)
 vs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(vs)
+with mock.patch.dict(sys.modules, {name: mock.MagicMock() for name in ("gi", "gi.repository")}):
+    _spec.loader.exec_module(vs)
 
 
 def ref_x25(data, crc=0xFFFF):
