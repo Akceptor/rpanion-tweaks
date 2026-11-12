@@ -1,7 +1,7 @@
 # RTP output with automatic WebRTC input selection
 
 Date: 2026-11-12
-Status: proposed design; architecture approved in conversation, written specification awaiting review.
+Status: approved for implementation on 2026-11-12.
 
 ## Goal
 
@@ -131,7 +131,9 @@ Generate a new instance identifier on each video-process start. Compare descript
 identity using instance, mode, codec and endpoint; heartbeat timestamps alone must
 not cause input rebuilds. On orderly shutdown, remove state only if its instance
 still belongs to this process, preventing an old process from deleting newer state.
-An unclean exit expires through the three-second freshness check.
+An unclean exit expires through the three-second freshness check. Publication and
+cleanup serialize using a persistent sibling lock file with a producer owner ID;
+a superseded producer cannot republish, and its loop stops on the next refresh.
 
 This first version follows the single-camera selector. Do not publish a misleading
 single endpoint for `--multirtsp`; log that automatic following is unsupported for

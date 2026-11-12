@@ -425,11 +425,13 @@ On the Pi:
 
 ```bash
 wget -O ~/video-server.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/video-server.py
+wget -O ~/video_stream_state.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/video_stream_state.py
 
 cd /usr/share/rpanion-server/app/python
 sudo cp video-server.py video-server.py.orig        # backup
+sudo cp ~/video_stream_state.py video_stream_state.py
 sudo cp ~/video-server.py video-server.py
-sudo chown rpanion:rpanion video-server.py
+sudo chown rpanion:rpanion video-server.py video_stream_state.py
 sudo systemctl restart rpanion-server
 ```
 
@@ -573,7 +575,7 @@ cd "$settings_src"
 Install the settings server and page:
 
 ```sh
-sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_settings.html python/fly_ground_config.py /opt/fly-ground/python/
+sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_settings.html python/fly_ground_config.py python/video_stream_state.py /opt/fly-ground/python/
 sudo install -d -m 0700 /var/lib/fly-ground-settings
 ```
 
@@ -650,3 +652,129 @@ ZeroTier connectivity, and access to TCP port 4001. To update this settings page
 later, repeat the source checkout and file installation steps, then run
 `sudo systemctl restart fly-ground-settings`; restarting the settings service
 does not restart the driving bridge.
+
+## Mission Planner RTP with automatic WebRTC input
+
+Rpanion's existing **RTP/RTSP** selector remains the video-mode control. With this
+optional setup, RTP mode pushes the same encoded, Lima-aware HUD video to the
+configured Mission Planner destination and a private loopback port for WebRTC.
+RTSP mode serves video as before, and WebRTC follows the actual RTSP mount path.
+The RTP copy adds no video encode. RTSP retains its existing per-client camera
+pipeline behavior.
+
+Keep Rpanion set to **H.264** for WebRTC. Mission Planner can still receive H.265,
+but the bridge waits and logs that H.265 is unsupported. Lima ON/OFF continues to
+control the coordinates burned into the common image. There is one coordinate
+mode at a time, shared by the viewers.
+
+### Install automatic following
+
+Update the repository checkout first. Back up the installed video and bridge
+Python files. The examples below use the Debian package paths documented above;
+verify them and the service identity on your Pi:
+
+```sh
+systemctl show rpanion-server -p User -p Group -p FragmentPath
+sudo ss -lunp 'sport = :5601'
+gst-inspect-1.0 multiudpsink
+gst-inspect-1.0 udpsrc
+gst-inspect-1.0 rtpjitterbuffer
+```
+
+Port 5601 on the Pi must be free. It is independent of Mission Planner's video
+port on the PC and of the direct/Lima MAVLink ports (14550/14551). If another
+service uses it, choose another local port in the drop-in below.
+
+From this repository's root, install the shared module **before** either script
+that imports it:
+
+```sh
+sudo install -o rpanion -g rpanion -m 0644 python/video_stream_state.py /usr/share/rpanion-server/app/python/
+sudo cp -a python/. /opt/fly-ground/python/
+sudo install -o rpanion -g rpanion -m 0755 python/video-server.py /usr/share/rpanion-server/app/python/video-server.py
+sudo install -d -m 0755 /etc/systemd/system/rpanion-server.service.d
+sudo install -m 0644 systemd/rpanion-video-following.conf /etc/systemd/system/rpanion-server.service.d/video-following.conf
+sudo systemctl daemon-reload
+sudo systemctl restart rpanion-server
+```
+
+The drop-in enables the local RTP copy and creates `/run/rpanion-video` with the
+Rpanion service's user as owner. Confirm its video child can write there. If the
+service launches the child as a different user, correct directory ownership through
+the service's existing deployment setup before enabling following. The bridge only
+reads the directory; its `PrivateTmp` isolation does not affect `/run`. A small
+persistent sibling lock file serializes producer ownership until `/run` is cleared
+on reboot; leave that file in place while video processes may be running.
+
+Start video from the Rpanion page, then check the description and access as the
+bridge's service user:
+
+```sh
+sudo -u rpanion cat /run/rpanion-video/state.json
+journalctl -u rpanion-server -n 40 --no-pager
+```
+
+Set `FLY_VIDEO_SOURCE=auto` once in `/etc/fly-ground.env` (or the existing settings
+service's symlink target), then restart the bridge:
+
+```sh
+sudo systemctl restart fly-ground
+journalctl -u fly-ground -n 40 --no-pager
+```
+
+The settings page preserves this additional environment assignment when saving
+its existing fields. If that page is installed, restart `fly-ground-settings`
+after updating its Python modules. It does not need new input fields.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `RPANION_WEBRTC_RTP_PORT` | unset: fanout disabled | Video producer's loopback copy port; supplied drop-in sets `5601` |
+| `RPANION_VIDEO_STATE_FILE` | unset: publication disabled | Video producer's atomic description; supplied drop-in sets `/run/rpanion-video/state.json` |
+| `FLY_VIDEO_SOURCE` | `rtsp` | `auto` follows Rpanion; `rtsp` uses the explicit URL |
+| `FLY_VIDEO_STATE_FILE` | `/run/rpanion-video/state.json` | Bridge's description path in automatic mode |
+| `FLY_RTSP_URL` | `rtsp://127.0.0.1:8554/video` | Explicit RTSP input; automatic mode uses the published mount instead |
+
+The local-copy port comes from the description, so only the producer port setting
+needs changing. Automatic following currently covers the single-camera selector;
+`--multirtsp` installations should use explicit RTSP input.
+
+### Use and recovery
+
+In **RTP** mode, enter the Mission Planner PC's reachable IP and receiver port in
+Rpanion's existing destination fields. Configure Mission Planner to receive RTP
+on that port. The Pi continues sending while the receiver is disconnected; after
+the link returns, decoding can resume at a subsequent keyframe. Verify this with
+your Mission Planner receiver and actual network.
+
+In **RTSP** mode, use Rpanion's displayed RTSP URL in Mission Planner as usual.
+WebRTC selects the appropriate input automatically in either mode. RTP-to-RTSP or
+RTSP-to-RTP switching and video-process restarts close the existing WebRTC session,
+release browser RC overrides and rebuild the input. The browser may need its
+existing **Refresh connection** action to rejoin; this change does not add automatic
+browser rejoining. A new session still requires fresh neutral control and
+**Resume driving**. Video selection recovers automatically on the Pi.
+
+Missing, invalid, or stale descriptions cause the bridge to wait locally, rather
+than guess an input or repeatedly join signaling. Producer descriptions refresh
+every second and expire after three seconds; the bridge checks changes every
+500 ms. The existing five-second no-frame watchdog also covers RTP. These timers
+are failure-detection limits, not an end-to-end video recovery guarantee.
+
+### Validate on the Pi
+
+With wheels off the ground, test RTP delivery to Mission Planner and WebRTC,
+Mission Planner link loss/restoration, a late WebRTC connection, video stop/start,
+and switching RTP -> RTSP -> RTP. Repeat Lima ON/OFF and the existing missing-anchor
+checks while comparing burned-in coordinates in both viewers. Check the actual
+browser reconnect action and ensure driving requires Resume after each new session.
+Run a 15-minute moving-image check for latency, CPU and video corruption. Local
+synthetic GStreamer tests do not replace these device and receiver checks.
+
+### Roll back
+
+Set `FLY_VIDEO_SOURCE=rtsp`, set the correct `FLY_RTSP_URL`, select RTSP on the
+Rpanion page and restart `fly-ground`. To disable producer integration, remove the
+two `Environment=` assignments from the installed `video-following.conf`, then run
+`sudo systemctl daemon-reload` and restart Rpanion. The helper module may remain
+installed. Restoring older scripts also requires restoring their matching bridge
+modules; keep the backups made before installation.

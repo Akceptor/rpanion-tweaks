@@ -4,6 +4,7 @@ import json
 import logging
 import math
 from urllib.parse import quote, urlsplit
+from fly_ground_video import VIDEO_CAPS, source_chain, video_send_chain
 
 
 LOG = logging.getLogger("fly-ground")
@@ -146,14 +147,13 @@ class PeerProtocol:
                 self.state(now_ms)
 
 
-RTSP_STALL_MS = 5000
-VIDEO_CAPS = "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"
+VIDEO_STALL_MS = 5000
 
 
 class GstPeer:
     """One GStreamer peer; all methods run on the GLib/asyncio main thread."""
 
-    def __init__(self, rtsp_url, ice_servers, signal, protocol, on_closed):
+    def __init__(self, source, ice_servers, signal, protocol, on_closed):
         import asyncio
         import gi
         gi.require_version("Gst", "1.0")
@@ -171,12 +171,13 @@ class GstPeer:
         # packets discarded there never reach webrtcbin's retransmission buffer.
         self.pipeline = Gst.parse_launch(
             "webrtcbin name=webrtc bundle-policy=max-bundle "
-            "rtspsrc name=source protocols=tcp latency=0 ! rtph264depay name=depay ! h264parse "
-            "! video/x-h264,alignment=au "
-            "! queue name=q max-size-buffers=0 max-size-bytes=0 max-size-time=300000000 leaky=downstream "
-            "! rtph264pay name=pay config-interval=1 pt=96 "
-            f"! {VIDEO_CAPS} ! webrtc.")
-        self.pipeline.get_by_name("source").set_property("location", rtsp_url)
+            + source_chain(source) + video_send_chain() + "! webrtc.")
+        element = self.pipeline.get_by_name("source")
+        if source.transport == "RTP":
+            element.set_property("address", source.rtp_host)
+            element.set_property("port", source.rtp_port)
+        else:
+            element.set_property("location", source.rtsp_url)
         self.webrtc = self.pipeline.get_by_name("webrtc")
         self.webrtc.set_property("stun-server", "stun://stun.cloudflare.com:3478")
         for uri in turn_uris(ice_servers):
@@ -322,8 +323,8 @@ class GstPeer:
         count, since = self.stall_check
         if count != self.counts["depay"] or since is None:
             self.stall_check = (self.counts["depay"], now_ms)
-        elif now_ms - since > RTSP_STALL_MS:
-            raise RuntimeError(f"RTSP stalled: no video for {RTSP_STALL_MS // 1000}s")
+        elif now_ms - since > VIDEO_STALL_MS:
+            raise RuntimeError(f"Video input stalled: no video for {VIDEO_STALL_MS // 1000}s")
 
     def poll_bus(self):
         Gst = self.Gst
@@ -347,7 +348,7 @@ class GstPeer:
             if msg.type == self.Gst.MessageType.ERROR:
                 error, _debug = msg.parse_error()
                 raise RuntimeError(f"GStreamer: {error.message}")
-            raise RuntimeError("RTSP stream ended")
+            raise RuntimeError("Video input ended")
 
     def close(self):
         self.pipeline.set_state(self.Gst.State.NULL)

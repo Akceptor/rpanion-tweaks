@@ -4,6 +4,8 @@ import hashlib
 import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+from pathlib import Path
+from video_stream_state import STATE_FILE
 
 
 CODE_RE = re.compile(r"CRAWLER(?:-[0-9A-HJKMNP-TV-Z]{4}){3}\Z")
@@ -46,6 +48,8 @@ class Settings:
     planner_sysid: int
     planner_compid: int
     session_seconds: int
+    video_source: str = "rtsp"
+    video_state_file: str = STATE_FILE
 
     @classmethod
     def from_env(cls, env):
@@ -58,6 +62,12 @@ class Settings:
         rtsp = env.get("FLY_RTSP_URL", "rtsp://127.0.0.1:8554/video")
         if urlsplit(rtsp).scheme != "rtsp" or not urlsplit(rtsp).hostname:
             raise ValueError("invalid FLY_RTSP_URL")
+        video_source = env.get("FLY_VIDEO_SOURCE", "rtsp")
+        if video_source not in ("auto", "rtsp"):
+            raise ValueError("FLY_VIDEO_SOURCE must be auto or rtsp")
+        state_file = env.get("FLY_VIDEO_STATE_FILE", STATE_FILE)
+        if not isinstance(state_file, str) or not Path(state_file).is_absolute():
+            raise ValueError("FLY_VIDEO_STATE_FILE must be an absolute path")
         router = env.get("FLY_MAVLINK", "tcp:127.0.0.1:5760")
         if not router.startswith("tcp:"):
             raise ValueError("FLY_MAVLINK must be a TCP pymavlink connection")
@@ -78,4 +88,4 @@ class Settings:
             raise ValueError("Pi and Mission Planner MAVLink source IDs must differ")
         return cls(code, room_id_for(code), site, rtsp, router, channels, throttle, gcs_sysid,
                    gcs_compid, planner_sysid, planner_compid,
-                   _int(env, "FLY_SESSION_SECONDS", 3600, 0, 86400))
+                   _int(env, "FLY_SESSION_SECONDS", 3600, 0, 86400), video_source, state_file)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unattended Pi Ground: Rpanion RTSP to WebRTC, browser RC to MAVLink."""
+"""Unattended Pi Ground: Rpanion RTP/RTSP to WebRTC, browser RC to MAVLink."""
 
 import asyncio
 import json
@@ -13,6 +13,7 @@ from fly_ground_config import Settings
 from fly_ground_control import Arbiter
 from fly_ground_mavlink import MavlinkAdapter
 from fly_ground_peer import GstPeer, PeerProtocol, signal_url
+from fly_ground_video import SourceWatcher, VideoSourceChanged, wait_for_source
 
 
 LOG = logging.getLogger("fly-ground")
@@ -81,7 +82,7 @@ def log_status(protocol, arbiter, adapter, now):
              "never" if planner is None else f"{(now - planner) / 1000:.1f}s ago")
 
 
-async def run_session(settings):
+async def run_session(settings, source):
     import websockets
     from gi.repository import GLib
 
@@ -113,13 +114,15 @@ async def run_session(settings):
                              on_telemetry=lambda msg: send_session(telemetry_message(msg)))
     try:
         async with websockets.connect(signal_url(settings), max_size=65536, open_timeout=15) as ws:
-            peer = GstPeer(settings.rtsp_url, servers, queue_signal, protocol, on_closed)
+            peer = GstPeer(source, servers, queue_signal, protocol, on_closed)
+            watcher = SourceWatcher(settings, source)
             last_ping = last_state = last_status = now_ms()
             signal_open = True
             connecting_at = None
             context = GLib.MainContext.default()
             while not closed and not protocol.ended:
                 now = now_ms()
+                watcher.poll(now)
                 for _ in range(20):
                     if not context.pending():
                         break
@@ -183,10 +186,14 @@ async def run(settings):
     delay = 1
     while True:
         try:
-            await run_session(settings)
+            source = await wait_for_source(settings)
+            await run_session(settings, source)
             wait, delay = 1, 1
         except asyncio.CancelledError:
             raise
+        except VideoSourceChanged as exc:
+            LOG.info("%s; following current source", exc)
+            wait, delay = 1, 1
         except RoomRejected as exc:
             LOG.warning("%s; retrying in %ss", exc, REJECT_DELAY)
             wait, delay = next_delay(delay, exc)

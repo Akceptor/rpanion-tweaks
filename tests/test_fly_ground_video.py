@@ -1,15 +1,11 @@
 """Run on a GStreamer host to exercise the production H.264 send chain."""
 
-import ast
 from collections import Counter
-import inspect
 from pathlib import Path
 import sys
-import textwrap
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
-import fly_ground_peer
 
 try:
     import gi
@@ -27,14 +23,9 @@ class VideoQueueTest(unittest.TestCase):
             if Gst.ElementFactory.find(plugin) is None:
                 self.skipTest(f"requires {plugin}")
 
-        # Exercise the actual constructor's send chain, without opening a camera
-        # or negotiating a WebRTC session. AST evaluation extracts its launch
-        # string so the regression cannot silently test a duplicate pipeline.
-        tree = ast.parse(textwrap.dedent(inspect.getsource(fly_ground_peer.GstPeer.__init__)))
-        launch = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
-                      and isinstance(node.func, ast.Attribute) and node.func.attr == "parse_launch")
-        production = eval(compile(ast.Expression(launch.args[0]), "<pipeline>", "eval"), vars(fly_ground_peer))
-        chain = production.split("! h264parse", 1)[1].rsplit("! webrtc.", 1)[0]
+        # Exercise the production common send chain for both source transports.
+        from fly_ground_video import video_send_chain
+        chain = video_send_chain().split("! h264parse", 1)[1]
         pipeline = Gst.parse_launch(
             "videotestsrc is-live=true num-buffers=60 pattern=snow "
             "! video/x-raw,width=480,height=320,framerate=25/1 "
