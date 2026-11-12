@@ -160,7 +160,7 @@ class StallTest(unittest.TestCase):
         msg = SimpleNamespace(type=4, src=SimpleNamespace(get_name=lambda: secret),
                               parse_warning=lambda: (warning, 'debug ' + secret))
         gst = SimpleNamespace(MessageType=SimpleNamespace(ERROR=1, EOS=2, WARNING=4, STATE_CHANGED=8))
-        peer = SimpleNamespace(Gst=gst, log_counts=lambda now: None, check_stall=lambda now: None,
+        peer = SimpleNamespace(Gst=gst, _maybe_offer=lambda: None, log_counts=lambda now: None, check_stall=lambda now: None,
                                now=lambda: 0, bus=SimpleNamespace(timed_pop_filtered=Mock(side_effect=[msg, None])))
         with self.assertLogs('fly-ground', level='WARNING') as logs:
             GstPeer.poll_bus(peer)
@@ -177,7 +177,7 @@ class StallTest(unittest.TestCase):
         error = SimpleNamespace(message=secret, domain='gst-resource-error-quark', code=5)
         msg = SimpleNamespace(type=1, parse_error=lambda: (error, secret))
         gst = SimpleNamespace(MessageType=SimpleNamespace(ERROR=1, EOS=2, WARNING=4, STATE_CHANGED=8))
-        peer = SimpleNamespace(Gst=gst, log_counts=lambda now: None, check_stall=lambda now: None,
+        peer = SimpleNamespace(Gst=gst, _maybe_offer=lambda: None, log_counts=lambda now: None, check_stall=lambda now: None,
                                now=lambda: 0, bus=SimpleNamespace(timed_pop_filtered=Mock(return_value=msg)))
         with self.assertRaises(RuntimeError) as cm:
             GstPeer.poll_bus(peer)
@@ -225,3 +225,40 @@ class StallTest(unittest.TestCase):
         GstPeer.check_stall(peer, 9000)
         with self.assertRaisesRegex(RuntimeError, "Video input stalled"):
             GstPeer.check_stall(peer, 9001)
+
+class OfferTimingTest(unittest.TestCase):
+    def test_offer_waits_for_real_encoded_caps_and_runs_once(self):
+        from unittest.mock import Mock
+        from fly_ground_peer import GstPeer
+        peer = GstPeer.__new__(GstPeer)
+        peer.pipeline = Mock()
+        peer.webrtc = Mock()
+        peer.Gst = Mock()
+        peer.offer_pending = peer.offer_started = False
+        pad = peer.pipeline.get_by_name.return_value.get_static_pad.return_value
+        pad.get_current_caps.return_value = None
+        peer.offer()
+        peer.webrtc.emit.assert_not_called()
+        caps = Mock()
+        caps.is_fixed.return_value = True
+        caps.get_structure.return_value.has_field.return_value = True
+        pad.get_current_caps.return_value = caps
+        peer._maybe_offer()
+        peer._maybe_offer()
+        peer.offer()
+        peer.webrtc.emit.assert_called_once()
+        self.assertEqual(peer.webrtc.emit.call_args.args[0], 'create-offer')
+
+    def test_incomplete_caps_do_not_allow_an_offer_with_browser_defaults(self):
+        from unittest.mock import Mock
+        from fly_ground_peer import GstPeer
+        peer = GstPeer.__new__(GstPeer)
+        peer.pipeline = Mock()
+        peer.webrtc = Mock()
+        peer.Gst = Mock()
+        peer.offer_pending = peer.offer_started = False
+        caps = peer.pipeline.get_by_name.return_value.get_static_pad.return_value.get_current_caps.return_value
+        caps.is_fixed.return_value = True
+        caps.get_structure.return_value.has_field.side_effect = lambda name: name != 'profile-level-id'
+        peer.offer()
+        peer.webrtc.emit.assert_not_called()

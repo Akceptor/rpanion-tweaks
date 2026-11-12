@@ -17,6 +17,56 @@ except (ImportError, ValueError):
 
 @unittest.skipIf(Gst is None, "requires GStreamer/PyGObject")
 class VideoQueueTest(unittest.TestCase):
+    def test_early_offer_advertises_actual_encoder_profile_and_packetization(self):
+        gi.require_version("GstWebRTC", "1.0")
+        gi.require_version("GstSdp", "1.0")
+        from gi.repository import GstWebRTC, GstSdp
+        from fly_ground_peer import GstPeer
+        from fly_ground_video import VIDEO_CAPS, video_send_chain
+        Gst.init(None)
+        for plugin in ("webrtcbin", "nicesrc", "nicesink", "videotestsrc", "x264enc", "rtph264pay"):
+            if Gst.ElementFactory.find(plugin) is None:
+                self.skipTest(f"requires {plugin}")
+        pipeline = Gst.parse_launch(
+            "webrtcbin name=webrtc bundle-policy=max-bundle "
+            "videotestsrc is-live=true pattern=snow "
+            "! video/x-raw,width=480,height=320,framerate=25/1 "
+            "! x264enc tune=zerolatency bitrate=500 speed-preset=superfast "
+            "key-int-max=25 ! video/x-h264,profile=high " + video_send_chain() + "! webrtc.")
+        peer = GstPeer.__new__(GstPeer)
+        peer.pipeline, peer.webrtc, peer.Gst = pipeline, pipeline.get_by_name("webrtc"), Gst
+        peer.offer_pending = peer.offer_started = False
+        peer.webrtc.emit("get-transceiver", 0).set_property("codec-preferences", Gst.Caps.from_string(VIDEO_CAPS))
+        loop, descriptions = GLib.MainLoop(), []
+        def offered(promise, *_):
+            reply = promise.get_reply()
+            if reply and reply.has_field("offer"):
+                descriptions.append(reply.get_value("offer").sdp.as_text())
+            loop.quit()
+        peer._offer_ready = offered
+        def poll():
+            peer._maybe_offer()
+            return True
+        timer = GLib.timeout_add(20, poll)
+        expired = []
+        def timeout():
+            expired.append(True); loop.quit(); return False
+        timeout_id = GLib.timeout_add_seconds(5, timeout)
+        try:
+            pipeline.set_state(Gst.State.READY)
+            peer.offer()  # Request before there is any encoded format.
+            self.assertFalse(peer.offer_started)
+            pipeline.set_state(Gst.State.PLAYING)
+            loop.run()
+            self.assertTrue(descriptions, "offer was not created after encoded caps arrived")
+            actual = pipeline.get_by_name("pay").get_static_pad("src").get_current_caps().get_structure(0)
+            self.assertIn("packetization-mode=1", descriptions[0])
+            self.assertIn("profile-level-id=" + actual.get_string("profile-level-id"), descriptions[0])
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+            GLib.source_remove(timer)
+            if not expired: GLib.source_remove(timeout_id)
+
     def test_backpressure_never_delivers_partial_rtp_frames(self):
         Gst.init(None)
         for plugin in ("videotestsrc", "x264enc", "h264parse", "rtph264pay"):

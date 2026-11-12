@@ -217,6 +217,7 @@ class GstPeer:
         self.control.connect("on-message-data", self._control)
         self.session.connect("on-message-string", self._message)
         self.session.connect("on-open", self._opened)
+        self.offer_pending = self.offer_started = False
         self.counts = {}
         self.counts_logged_ms = 0
         self.stall_check = (None, None)
@@ -270,6 +271,24 @@ class GstPeer:
             self.loop.call_soon_threadsafe(self.on_closed)
 
     def offer(self):
+        if not self.offer_started:
+            self.offer_pending = True
+            self._maybe_offer()
+
+    def _maybe_offer(self):
+        if not self.offer_pending or self.offer_started:
+            return
+        # Before the first encoded frame, the generic preferences omit fmtp.
+        # Browsers then assume baseline/mode 0 even when the payloader sends
+        # High Profile/mode 1. Let the actual encoded caps reach webrtcbin first.
+        caps = self.pipeline.get_by_name("pay").get_static_pad("src").get_current_caps()
+        if caps is None or not caps.is_fixed():
+            return
+        media = caps.get_structure(0)
+        if not all(media.has_field(name) for name in ("profile-level-id", "packetization-mode")):
+            return
+        self.offer_pending = False
+        self.offer_started = True
         promise = self.Gst.Promise.new_with_change_func(self._offer_ready)
         self.webrtc.emit("create-offer", None, promise)
 
@@ -345,6 +364,7 @@ class GstPeer:
         Gst = self.Gst
         self.log_counts(self.now())
         self.check_stall(self.now())
+        self._maybe_offer()
         while True:
             msg = self.bus.timed_pop_filtered(
                 0, Gst.MessageType.ERROR | Gst.MessageType.EOS | Gst.MessageType.WARNING
