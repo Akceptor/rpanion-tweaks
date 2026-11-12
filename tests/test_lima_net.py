@@ -61,6 +61,9 @@ class NetTest(unittest.TestCase):
         probe = self.sock()
         self.serve = probe.getsockname()
         probe.close()
+        probe = self.sock()
+        self.local_serve = probe.getsockname()
+        probe.close()
         self.gcs = self.sock()
         self.status = self.sock()
         store = lima.AnchorStore(os.path.join(self.tmp.name, "anchor.json"))
@@ -70,7 +73,7 @@ class NetTest(unittest.TestCase):
             target=lima.run,
             args=(self.listen, self.serve, self.rewriter, self.stop),
             kwargs={"allow": self.allow, "clock": lambda: self.now[0],
-                    "status": self.status.getsockname()})
+                    "status": self.status.getsockname(), "local_serve": self.local_serve})
         self.thread.start()
 
     def tearDown(self):
@@ -86,11 +89,11 @@ class NetTest(unittest.TestCase):
         self.socks.append(s)
         return s
 
-    def connect(self, gcs):
+    def connect(self, gcs, serve=None):
         # the proxy may not have bound yet; UDP to an unbound port is silently lost
         gcs.settimeout(0.2)
         for _ in range(25):
-            gcs.sendto(gcs_heartbeat(), self.serve)
+            gcs.sendto(gcs_heartbeat(), serve or self.serve)
             time.sleep(0.05)
             self.router.sendto(heartbeat(), self.listen)
             try:
@@ -175,6 +178,52 @@ class NetTest(unittest.TestCase):
         other.settimeout(3)
         other.recvfrom(4096)
         self.assert_silent(self.gcs)
+
+    def test_local_and_remote_clients_both_receive_masked_position(self):
+        local = self.sock()
+        self.connect(self.gcs)
+        self.connect(local, self.local_serve)
+        self.router.sendto(gps_fix(), self.listen)
+        for client in (self.gcs, local):
+            client.settimeout(3)
+            while True:
+                data, _ = client.recvfrom(4096)
+                message = decode(data)[0]
+                if message.get_type() == "GPS_RAW_INT":
+                    break
+            self.assertAlmostEqual(message.lat / 1e7, FAKE[0], places=5)
+            self.assertAlmostEqual(message.lon / 1e7, FAKE[1], places=5)
+
+    def test_local_peer_expires_without_disconnecting_remote_client(self):
+        local = self.sock()
+        self.connect(local, self.local_serve)
+        self.now[0] += 4
+        self.connect(self.gcs)
+        self.drain(local)
+        self.now[0] += 1.5
+        self.router_pump()
+        self.gcs.settimeout(3)
+        self.gcs.recvfrom(4096)
+        self.assert_silent(local)
+
+    def test_local_peer_activates_lima_status_and_expires(self):
+        local = self.sock()
+        self.connect(local, self.local_serve)
+        self.wait_status(lima.status_datagram(True, FAKE))
+        self.now[0] += 5.5
+        self.router_pump()
+        self.wait_status(lima.status_datagram(False, FAKE))
+
+    def test_local_client_rc_override_reaches_router_unchanged(self):
+        local = self.sock()
+        self.connect(local, self.local_serve)
+        self.drain(self.router)
+        packet = frame(mavlink.MAVLink_rc_channels_override_message(1, 1, *([1500] * 8)),
+                       sysid=255, compid=191)
+        local.sendto(packet, self.local_serve)
+        self.router.settimeout(3)
+        received, _ = self.router.recvfrom(4096)
+        self.assertEqual(received, packet)
 
     def test_peer_expires(self):
         self.connect(self.gcs)
@@ -314,6 +363,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual(serve, ("0.0.0.0", 14551))
         self.assertIsNone(allow)
         self.assertEqual(run.call_args.kwargs["status"], ("127.0.0.1", 14571))
+        self.assertEqual(run.call_args.kwargs["local_serve"], ("127.0.0.1", 14552))
 
     def test_main_reads_serve_and_allow(self):
         env = {"LIMA_SERVE": "10.0.0.1:15000", "LIMA_GCS_ALLOW": "10.46.93.5, 10.46.93.6"}
@@ -333,7 +383,8 @@ class MainTest(unittest.TestCase):
         for key, val in (("LIMA_FAKE_ANCHOR", "x"), ("LIMA_LISTEN", "x"),
                          ("LIMA_MAX_TARGET_KM", "x"), ("LIMA_SERVE", "nope"), ("LIMA_STATUS", "nope"),
                          ("LIMA_GCS_ALLOW", ""), ("LIMA_GCS_ALLOW", "1.2.3"),
-                         ("LIMA_GCS_ALLOW", "1.2.3.4,x"), ("LIMA_GCS_ALLOW", "::1")):
+                         ("LIMA_GCS_ALLOW", "1.2.3.4,x"), ("LIMA_GCS_ALLOW", "::1"),
+                         ("LIMA_LOCAL_SERVE", "0.0.0.0:14552")):
             with mock.patch.dict(os.environ, {key: val}, clear=True), \
                     contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as cm:
