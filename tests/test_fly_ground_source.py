@@ -46,6 +46,25 @@ class SourceTest(unittest.TestCase):
         self.settings.video_source = 'rtsp'
         self.assertEqual(video.resolve_source(self.settings).rtsp_url, self.settings.rtsp_url)
 
+    def test_native_only_allows_data_session_without_unsupported_video_codec(self):
+        native = VideoSource('test', 'RTP', 'H265', '127.0.0.1', None,
+                             webrtc_enabled=False, output_mode='rpanion')
+        self.publish(native)
+        resolved = video.resolve_source(self.settings)
+        self.assertFalse(resolved.webrtc_enabled)
+        self.assertEqual(resolved.codec, 'H265')
+
+    def test_explicit_rtsp_mode_also_honors_output_selection(self):
+        self.settings.video_source = 'rtsp'
+        with patch.object(video, 'read_output_mode', return_value='rpanion'):
+            native = video.resolve_source(self.settings)
+            self.assertFalse(native.webrtc_enabled)
+            watcher = video.SourceWatcher(self.settings, native)
+            watcher.poll(0)
+        with patch.object(video, 'read_output_mode', return_value='webrtc'):
+            with self.assertRaises(video.VideoSourceChanged):
+                watcher.poll(500)
+
     def test_watcher_ignores_heartbeat_detects_restart_mode_and_disappearance(self):
         publisher = self.publish()
         watcher = video.SourceWatcher(self.settings, video.resolve_source(self.settings))

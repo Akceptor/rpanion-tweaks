@@ -52,6 +52,29 @@ class StateTest(unittest.TestCase):
         self.assertEqual(self.read(), self.read(updated_monotonic=100.5))
         self.assertNotEqual(self.read(), self.read(instance='producer-2'))
 
+    def test_output_selection_and_legacy_state(self):
+        legacy = self.read()
+        self.assertTrue(legacy.webrtc_enabled)
+        self.assertEqual(legacy.output_mode, 'both')
+        native = self.read(output_mode='rpanion', webrtc_enabled=False, rtp_port=None)
+        self.assertIsNotNone(native)
+        self.assertFalse(native.webrtc_enabled)
+        for bad in (dict(output_mode='invalid'), dict(webrtc_enabled='false'),
+                    dict(output_mode='rpanion', webrtc_enabled=True)):
+            self.assertIsNone(self.read(**bad))
+
+    def test_output_selection_routes_only_requested_rtp_destinations(self):
+        self.assertEqual(state.rtp_destinations('192.0.2.1:5400', 5601, 'webrtc'),
+                         [('127.0.0.1', 5601)])
+        self.assertEqual(state.rtp_destinations('192.0.2.1:5400', 5601, 'rpanion'),
+                         [('192.0.2.1', 5400)])
+        self.assertEqual(state.rtp_destinations('192.0.2.1:5400', 5601, 'both'),
+                         [('192.0.2.1', 5400), ('127.0.0.1', 5601)])
+        with self.assertRaises(ValueError):
+            state.rtp_destinations('192.0.2.1:5400', None, 'webrtc')
+        with self.assertRaises(ValueError):
+            state.rtp_destinations('192.0.2.1:5400', 5601, 'invalid')
+
     def test_atomic_publisher_and_owned_cleanup(self):
         source = self.read()
         first = state.StatePublisher(self.path, source)

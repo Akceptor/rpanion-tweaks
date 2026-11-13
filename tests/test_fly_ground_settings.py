@@ -7,9 +7,12 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
 from fly_ground_settings import ConfigStore, SettingsServer, Conflict
+from video_output import VideoOutputStore
+from types import SimpleNamespace
 
 BASE = '# comment\nFLY_ROOM_CODE=CRAWLER-1234-5678-9012\nFLY_SITE_URL="https://example.com"\nEXTRA="keep me"\n'
 HOST_TOKEN = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip('=')
@@ -102,7 +105,7 @@ class HttpTest(StoreTest):
     def setUp(self):
         super().setUp()
         self.restarts = []
-        self.server = SettingsServer(('127.0.0.1', 0), self.store, restart=lambda: self.restarts.append(True))
+        self.server = SettingsServer(('127.0.0.1', 0), self.store, restart=lambda: self.restarts.append(True), output_store=VideoOutputStore(Path(self.tmp.name) / 'output.json'))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.finish)
@@ -139,6 +142,43 @@ class HttpTest(StoreTest):
         self.assertFalse(self.restarts)
         self.assertEqual(self.request('POST','/api/restart',{},headers)[0],200)
         self.assertEqual(self.restarts,[True])
+
+    def test_video_output_is_separate_revisioned_and_protected(self):
+        _, settings = self.request('GET', '/api/settings')
+        with patch('fly_ground_settings.read_state', return_value=None):
+            status, output = self.request('GET', '/api/video-output')
+        self.assertEqual(status, 200)
+        self.assertEqual(output['mode'], 'both')
+        self.assertFalse(output['running'])
+        self.assertIsNone(output['applied_mode'])
+        self.assertIsNone(output['pending'])
+        headers = {'Content-Type': 'application/json', 'X-CSRF-Token': settings['token']}
+        body = {'mode': 'rpanion', 'revision': output['revision']}
+        self.assertEqual(self.request('POST', '/api/video-output', body)[0], 403)
+        self.assertEqual(self.request('POST', '/api/video-output', body, dict(headers, Origin='http://evil.example'))[0], 403)
+        for bad in ({'mode': 'webrtc'}, dict(body, extra=1), dict(body, mode='RTP')):
+            self.assertEqual(self.request('POST', '/api/video-output', bad, headers)[0], 400)
+        with patch('fly_ground_settings.read_state', return_value=SimpleNamespace(transport='RTP', output_mode='both')):
+            status, saved = self.request('POST', '/api/video-output', body, headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(saved['transport'], 'RTP')
+        self.assertEqual(saved['applied_mode'], 'both')
+        self.assertTrue(saved['pending'])
+        self.assertEqual(self.request('POST', '/api/video-output', body, headers)[0], 409)
+        self.assertEqual(self.request('GET', '/api/settings')[1], settings)
+        self.assertFalse(self.restarts)
+
+    def test_video_output_reports_fresh_applied_state_and_bundled_ui(self):
+        with patch('fly_ground_settings.read_state', return_value=SimpleNamespace(transport='RTSP', output_mode='both')):
+            status, data = self.request('GET', '/api/video-output')
+        self.assertEqual(status, 200)
+        self.assertEqual(data['transport'], 'RTSP')
+        self.assertEqual(data['applied_mode'], 'both')
+        self.assertFalse(data['pending'])
+        page = Path(__file__).resolve().parents[1] / 'python' / 'fly_ground_settings.html'
+        html = page.read_text()
+        for text in ('id="videoOutput"', 'id="applyVideoOutput"', '/api/video-output', 'Refresh connection', 'RTP/RTSP only'):
+            self.assertIn(text, html)
 
     def test_host_token_api_checks_csrf_shape_revision_and_never_echoes_secret(self):
         _, old = self.request('GET', '/api/settings')

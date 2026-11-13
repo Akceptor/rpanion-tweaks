@@ -19,6 +19,7 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 import uuid
+from video_output import validate_output_mode
 
 
 STATE_FILE = '/run/rpanion-video/state.json'
@@ -48,9 +49,12 @@ def parse_destination(value):
     return host, port_number(parsed.port)
 
 
-def rtp_destinations(remote, local_port):
-    destinations = [parse_destination(remote)]
-    if local_port is not None:
+def rtp_destinations(remote, local_port, output_mode='both'):
+    validate_output_mode(output_mode)
+    if output_mode == 'webrtc' and local_port is None:
+        raise ValueError('WebRTC-only RTP output requires a local RTP port')
+    destinations = [] if output_mode == 'webrtc' else [parse_destination(remote)]
+    if local_port is not None and output_mode != 'rpanion':
         local = ('127.0.0.1', port_number(local_port))
         if local not in destinations:
             destinations.append(local)
@@ -83,9 +87,14 @@ class VideoSource:
     rtp_host: str | None = None
     rtp_port: int | None = None
     rtsp_url: str | None = None
+    webrtc_enabled: bool = True
+    output_mode: str = 'both'
 
 
 def validate_source(source):
+    validate_output_mode(source.output_mode)
+    if type(source.webrtc_enabled) is not bool or source.webrtc_enabled != (source.output_mode != 'rpanion'):
+        raise ValueError('inconsistent WebRTC video selection')
     if not isinstance(source.instance, str) or not 1 <= len(source.instance) <= 128:
         raise ValueError('invalid video instance')
     if source.codec not in ('H264', 'H265'):
@@ -93,6 +102,8 @@ def validate_source(source):
     if source.transport == 'RTP':
         if source.rtp_host != '127.0.0.1' or source.rtsp_url is not None:
             raise ValueError('RTP source must be private loopback')
+        if source.rtp_port is None and not source.webrtc_enabled:
+            return source
         if type(source.rtp_port) is not int:
             raise ValueError('invalid RTP port')
         port_number(source.rtp_port)
@@ -123,7 +134,9 @@ def read_state(path=STATE_FILE, now=None):
         age = (time.monotonic() if now is None else now) - updated
         if not 0 <= age <= MAX_AGE:
             return None
-        return validate_source(VideoSource(**{key: raw[key] for key in VideoSource.__dataclass_fields__}))
+        values = {key: raw[key] for key in VideoSource.__dataclass_fields__
+                  if key not in ('webrtc_enabled', 'output_mode') or key in raw}
+        return validate_source(VideoSource(**values))
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
 

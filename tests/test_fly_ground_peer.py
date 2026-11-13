@@ -227,6 +227,19 @@ class StallTest(unittest.TestCase):
             GstPeer.check_stall(peer, 9001)
 
 class OfferTimingTest(unittest.TestCase):
+    def test_data_only_offer_does_not_wait_for_nonexistent_video_caps(self):
+        from unittest.mock import Mock
+        from fly_ground_peer import GstPeer
+        peer = GstPeer.__new__(GstPeer)
+        peer.pipeline, peer.webrtc, peer.Gst = Mock(), Mock(), Mock()
+        peer.video_enabled = False
+        peer.offer_pending = peer.offer_started = False
+        peer.offer()
+        peer.pipeline.get_by_name.assert_not_called()
+        self.assertEqual(peer.webrtc.emit.call_args.args[0], 'create-offer')
+        GstPeer.check_stall(peer, 100000)
+        GstPeer.log_counts(peer, 100000)
+
     def test_offer_waits_for_real_encoded_caps_and_runs_once(self):
         from unittest.mock import Mock
         from fly_ground_peer import GstPeer

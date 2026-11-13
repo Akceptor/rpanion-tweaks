@@ -1,6 +1,7 @@
 """Run on a GStreamer host to exercise the production H.264 send chain."""
 
 from collections import Counter
+import asyncio
 from pathlib import Path
 import sys
 import unittest
@@ -139,6 +140,40 @@ class VideoQueueTest(unittest.TestCase):
         partial = {ts: (count, produced[ts]) for ts, count in delivered.items()
                    if count != produced[ts]}
         self.assertEqual(partial, {}, "queue discarded RTP fragments of delivered frames")
+
+
+@unittest.skipIf(Gst is None, 'requires GStreamer/PyGObject')
+class NativeOnlyPeerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_native_only_offer_keeps_data_channels_without_video(self):
+        from unittest.mock import Mock
+        from fly_ground_peer import GstPeer
+        from video_stream_state import VideoSource
+        Gst.init(None)
+        for plugin in ('webrtcbin', 'nicesrc', 'nicesink'):
+            if Gst.ElementFactory.find(plugin) is None:
+                self.skipTest(f'requires {plugin}')
+        source = VideoSource('native', 'RTP', 'H265', '127.0.0.1', None,
+                             webrtc_enabled=False, output_mode='rpanion')
+        messages = []
+        peer = GstPeer(source, [], messages.append, Mock(), lambda: None)
+        self.addCleanup(peer.close)
+        self.assertIsNone(peer.pipeline.get_by_name('source'))
+        self.assertIsNone(peer.pipeline.get_by_name('pay'))
+        self.assertEqual(peer.control.get_property('label'), 'control')
+        self.assertEqual(peer.session.get_property('label'), 'session')
+        peer.offer()
+        deadline = asyncio.get_running_loop().time() + 5
+        while not any(m.get('type') == 'offer' for m in messages) and asyncio.get_running_loop().time() < deadline:
+            context = GLib.MainContext.default()
+            for _ in range(20):
+                if not context.pending(): break
+                context.iteration(False)
+            peer.poll_bus()
+            await asyncio.sleep(.02)
+        offers = [m['sdp'] for m in messages if m.get('type') == 'offer']
+        self.assertTrue(offers, 'data-only peer never offered')
+        self.assertIn('m=application', offers[0])
+        self.assertNotIn('m=video', offers[0])
 
 
 if __name__ == "__main__":

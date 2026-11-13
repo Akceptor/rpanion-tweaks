@@ -18,7 +18,7 @@ try:
     import gi
     gi.require_version('Gst', '1.0')
     gi.require_version('GstRtspServer', '1.0')
-    from gi.repository import Gst
+    from gi.repository import Gst, GLib
     Gst.init(None)
     HAVE_GST = all(Gst.ElementFactory.find(name) for name in (
         'x264enc', 'videotestsrc', 'rtph264pay', 'rtph264depay', 'h264parse',
@@ -43,7 +43,7 @@ class FanoutTest(unittest.TestCase):
         sock.settimeout(3)
         return sock
 
-    def sender(self, remote_port, local_port, remote_host='127.0.0.1'):
+    def sender(self, remote_port, local_port, remote_host='127.0.0.1', output_mode='both'):
         args = SimpleNamespace(videosource='testsrc', height=96, width=128, bitrate=200,
             format='video/x-raw', rotation=0, fps=25, timestamp=False, compression='H264',
             udp=f'{remote_host}:{remote_port}')
@@ -52,10 +52,55 @@ class FanoutTest(unittest.TestCase):
         def source(*_args, payload=True):
             return camera + (' ! rtph264pay config-interval=1 name=pay0 pt=96' if payload else '')
         with patch.object(self.server, 'getPipeline', side_effect=source):
-            pipeline = self.server.build_rtp_pipeline(args, local_port)
+            pipeline = self.server.build_rtp_pipeline(args, local_port, output_mode)
         self.addCleanup(pipeline.set_state, Gst.State.NULL)
         self.assertNotEqual(pipeline.set_state(Gst.State.PLAYING), Gst.StateChangeReturn.FAILURE)
         return pipeline
+
+    def test_single_output_modes_deliver_only_to_selected_socket(self):
+        for mode in ('webrtc', 'rpanion'):
+            with self.subTest(mode=mode):
+                remote, local = self.receiver(), self.receiver()
+                pipeline = self.sender(remote.getsockname()[1], local.getsockname()[1], output_mode=mode)
+                selected, muted = (local, remote) if mode == 'webrtc' else (remote, local)
+                self.assertEqual(selected.recv(65535)[0] >> 6, 2)
+                muted.settimeout(.2)
+                with self.assertRaises(socket.timeout):
+                    muted.recv(65535)
+                self.assertIsNone(pipeline.get_by_name('fanout'))
+                pipeline.set_state(Gst.State.NULL)
+
+    def test_two_rtsp_clients_share_capture_and_receive_video(self):
+        server = self.server.GstServer('127.0.0.1', '0')
+        self.addCleanup(GLib.source_remove, server.sourceID)
+        loop = GLib.MainLoop()
+        thread = threading.Thread(target=loop.run, daemon=True)
+        created = []
+        def camera(*_args, **_kwargs):
+            created.append(True)
+            return ('videotestsrc is-live=true ! video/x-raw,width=128,height=96,framerate=25/1 '
+                    '! x264enc tune=zerolatency key-int-max=10 '
+                    '! rtph264pay config-interval=1 name=pay0 pt=96')
+        clients = []
+        with patch.object(self.server, 'getPipeline', side_effect=camera):
+            server.addStream('testsrc', 96, 128, 500, 'video/x-raw', 0, 25, False, 'H264')
+            port = server.server.get_bound_port()
+            self.assertGreater(port, 0)
+            thread.start()
+            try:
+                for _ in range(2):
+                    client = Gst.parse_launch(f'rtspsrc location=rtsp://127.0.0.1:{port}/testsrc '
+                        'protocols=tcp latency=0 ! rtph264depay ! appsink name=video sync=false max-buffers=2 drop=true')
+                    clients.append(client)
+                    client.set_state(Gst.State.PLAYING)
+                    self.assertIsNotNone(client.get_by_name('video').emit('try-pull-sample', 5 * Gst.SECOND))
+                self.assertEqual(len(created), 1, 'RTSP clients competed for separate camera pipelines')
+                self.assertIsNotNone(clients[0].get_by_name('video').emit('try-pull-sample', Gst.SECOND))
+            finally:
+                for client in clients:
+                    client.set_state(Gst.State.NULL)
+                loop.quit()
+                thread.join(3)
 
     def test_same_rtp_packets_and_late_receiver_restart(self):
         remote = self.receiver()
@@ -71,11 +116,16 @@ class FanoutTest(unittest.TestCase):
             # Match an exact datagram, including SSRC, sequence, timestamp and payload.
             deadline = time.monotonic() + 3
             match = False
+            same_media = []
             while time.monotonic() < deadline:
-                if remote.recv(65535) == packet:
+                received = remote.recv(65535)
+                if received[:2] + received[4:] == packet[:2] + packet[4:]:
+                    same_media.append((int.from_bytes(received[2:4], 'big'), int.from_bytes(packet[2:4], 'big')))
+                if received == packet:
                     match = True
                     break
-            self.assertTrue(match, 'fanout did not preserve the same RTP packet')
+            self.assertTrue(match, 'fanout did not preserve the same RTP packet; '
+                            f'matching media remote/local sequence numbers: {same_media}')
             local.close()
             remote.recv(65535)  # Mission Planner branch continues with no local receiver.
         error = pipeline.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR)

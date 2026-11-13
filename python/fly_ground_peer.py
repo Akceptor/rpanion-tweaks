@@ -181,28 +181,39 @@ class GstPeer:
         self.loop = asyncio.get_running_loop()
         self.Gst, self.GstSdp, self.GstWebRTC = Gst, GstSdp, GstWebRTC
         self.signal, self.protocol, self.on_closed = signal, protocol, on_closed
+        self.video_enabled = source.webrtc_enabled
         # Bound latency before packetization, on complete H.264 access units.
         # Leaking RTP packets can truncate frames during motion/bitrate bursts;
         # packets discarded there never reach webrtcbin's retransmission buffer.
-        self.pipeline = Gst.parse_launch(
-            "webrtcbin name=webrtc bundle-policy=max-bundle "
-            + source_chain(source) + video_send_chain() + "! webrtc.")
-        element = self.pipeline.get_by_name("source")
-        if source.transport == "RTP":
-            element.set_property("address", source.rtp_host)
-            element.set_property("port", source.rtp_port)
+        launch = "webrtcbin name=webrtc bundle-policy=max-bundle "
+        if self.video_enabled:
+            launch += source_chain(source) + video_send_chain() + "! webrtc."
+            self.pipeline = Gst.parse_launch(launch)
         else:
-            element.set_property("location", source.rtsp_url)
+            self.pipeline = Gst.Pipeline.new(None)
+            webrtc = Gst.ElementFactory.make('webrtcbin', 'webrtc')
+            if webrtc is None:
+                raise RuntimeError('GStreamer webrtcbin plugin missing')
+            webrtc.set_property('bundle-policy', GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
+            self.pipeline.add(webrtc)
+        if self.video_enabled:
+            element = self.pipeline.get_by_name("source")
+            if source.transport == "RTP":
+                element.set_property("address", source.rtp_host)
+                element.set_property("port", source.rtp_port)
+            else:
+                element.set_property("location", source.rtsp_url)
         self.webrtc = self.pipeline.get_by_name("webrtc")
         self.webrtc.set_property("stun-server", "stun://stun.cloudflare.com:3478")
         for uri in turn_uris(ice_servers):
             self.webrtc.emit("add-turn-server", uri)
         # Without codec-preferences, create-offer fails until RTSP caps reach webrtcbin.
-        video = self.webrtc.emit("get-transceiver", 0)
-        if video is None:
-            raise RuntimeError("webrtcbin has no video transceiver")
-        video.set_property("direction", GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
-        video.set_property("codec-preferences", Gst.Caps.from_string(VIDEO_CAPS))
+        if self.video_enabled:
+            video = self.webrtc.emit("get-transceiver", 0)
+            if video is None:
+                raise RuntimeError("webrtcbin has no video transceiver")
+            video.set_property("direction", GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
+            video.set_property("codec-preferences", Gst.Caps.from_string(VIDEO_CAPS))
         self.webrtc.connect("on-ice-candidate", self._ice)
         self.webrtc.connect("notify::connection-state", self._connection)
         self.webrtc.connect("notify::ice-connection-state", self._ice_state)
@@ -221,9 +232,10 @@ class GstPeer:
         self.counts = {}
         self.counts_logged_ms = 0
         self.stall_check = (None, None)
-        for name, pad in (("depay", "src"), ("pay", "src"), ("q", "src")):
-            self._count(self.pipeline.get_by_name(name).get_static_pad(pad), name)
-        self._count(self.pipeline.get_by_name("q").get_static_pad("sink"), "q-in")
+        if self.video_enabled:
+            for name, pad in (("depay", "src"), ("pay", "src"), ("q", "src")):
+                self._count(self.pipeline.get_by_name(name).get_static_pad(pad), name)
+            self._count(self.pipeline.get_by_name("q").get_static_pad("sink"), "q-in")
         self.bus = self.pipeline.get_bus()
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -281,12 +293,13 @@ class GstPeer:
         # Before the first encoded frame, the generic preferences omit fmtp.
         # Browsers then assume baseline/mode 0 even when the payloader sends
         # High Profile/mode 1. Let the actual encoded caps reach webrtcbin first.
-        caps = self.pipeline.get_by_name("pay").get_static_pad("src").get_current_caps()
-        if caps is None or not caps.is_fixed():
-            return
-        media = caps.get_structure(0)
-        if not all(media.has_field(name) for name in ("profile-level-id", "packetization-mode")):
-            return
+        if getattr(self, 'video_enabled', True):
+            caps = self.pipeline.get_by_name("pay").get_static_pad("src").get_current_caps()
+            if caps is None or not caps.is_fixed():
+                return
+            media = caps.get_structure(0)
+            if not all(media.has_field(name) for name in ("profile-level-id", "packetization-mode")):
+                return
         self.offer_pending = False
         self.offer_started = True
         promise = self.Gst.Promise.new_with_change_func(self._offer_ready)
@@ -338,6 +351,8 @@ class GstPeer:
         pad.add_probe(self.Gst.PadProbeType.BUFFER | self.Gst.PadProbeType.BUFFER_LIST, probe)
 
     def log_counts(self, now_ms):
+        if not getattr(self, 'video_enabled', True):
+            return
         if now_ms - self.counts_logged_ms < 5000:
             return
         self.counts_logged_ms = now_ms
@@ -353,6 +368,8 @@ class GstPeer:
             LOG.info("Remote description applied")
 
     def check_stall(self, now_ms):
+        if not getattr(self, 'video_enabled', True):
+            return
         # Rpanion restarting its stream leaves rtspsrc connected but silent, with only a warning.
         count, since = self.stall_check
         if count != self.counts["depay"] or since is None:
