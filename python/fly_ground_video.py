@@ -5,6 +5,7 @@ import logging
 import time
 
 from video_stream_state import VideoSource, read_state
+from video_output import read_output_mode
 
 
 LOG = logging.getLogger('fly-ground')
@@ -21,11 +22,13 @@ class VideoSourceChanged(RuntimeError):
 
 def resolve_source(settings):
     if settings.video_source == 'rtsp':
-        return VideoSource('explicit', 'RTSP', 'H264', rtsp_url=settings.rtsp_url)
+        mode = read_output_mode()
+        return VideoSource('explicit', 'RTSP', 'H264', rtsp_url=settings.rtsp_url,
+                           output_mode=mode, webrtc_enabled=mode != 'rpanion')
     source = read_state(settings.video_state_file)
     if source is None:
         raise VideoUnavailable('waiting for fresh Rpanion video state')
-    if source.codec != 'H264':
+    if source.webrtc_enabled and source.codec != 'H264':
         raise VideoUnavailable(f'Rpanion video codec {source.codec} is unsupported by WebRTC; select H264')
     return source
 
@@ -49,7 +52,7 @@ class SourceWatcher:
         self.next_check_ms = 0
 
     def poll(self, now_ms):
-        if self.settings.video_source != 'auto' or now_ms < self.next_check_ms:
+        if now_ms < self.next_check_ms:
             return
         self.next_check_ms = now_ms + 500
         try:

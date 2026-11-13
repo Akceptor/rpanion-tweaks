@@ -13,7 +13,7 @@ Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/fly-ground-settings
+ReadWritePaths=/var/lib/fly-ground-settings /var/lib/rpanion-video
 ProtectHome=true
 PrivateTmp=true
 

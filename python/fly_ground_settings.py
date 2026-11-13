@@ -18,6 +18,8 @@ import threading
 
 from fly_ground_config import Settings
 from fly_ground_auth import validate_host_token
+from video_output import VideoOutputStore, Conflict as OutputConflict
+from video_stream_state import read_state
 
 FIELDS = {
     'FLY_ROOM_CODE': 'code', 'FLY_SITE_URL': 'site_url', 'FLY_RTSP_URL': 'rtsp_url',
@@ -157,8 +159,10 @@ def restart_service():
 
 class SettingsServer(ThreadingHTTPServer):
     daemon_threads = True
-    def __init__(self, address, store, restart=restart_service):
+    def __init__(self, address, store, restart=restart_service, output_store=None):
         self.store, self.restart = store, restart
+        self.output_store = output_store if output_store is not None else VideoOutputStore()
+        self.write_lock = threading.RLock()
         self.token = secrets.token_urlsafe(32)
         super().__init__(address, Handler)
 
@@ -185,11 +189,20 @@ class Handler(BaseHTTPRequestHandler):
     def state(self, result=None):
         return dict(result or self.server.store.read(), token=self.server.token)
 
+    def output_state(self, result=None):
+        saved = self.server.output_store.read() if result is None else result
+        source = read_state()
+        applied = source.output_mode if source is not None else None
+        return dict(saved, transport=source.transport if source is not None else None,
+                    applied_mode=applied, running=source is not None,
+                    pending=saved["mode"] != applied if source is not None else None)
+
     def do_GET(self):
         try:
             if self.path == '/':
                 self.respond(200, Path(__file__).with_name('fly_ground_settings.html').read_bytes(), 'text/html; charset=utf-8')
             elif self.path == '/api/settings': self.respond(200, self.state())
+            elif self.path == '/api/video-output': self.respond(200, self.output_state())
             else: self.respond(404, {'error': 'Not found'})
         except (OSError, ValueError): self.respond(500, {'error': 'Unable to read settings; check the environment file'})
 
@@ -207,19 +220,25 @@ class Handler(BaseHTTPRequestHandler):
             if length <= 0 or length > 16384: raise ValueError('Invalid request size')
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict): raise ValueError('JSON object required')
-            if self.path == '/api/settings':
-                result = self.server.store.save(data.get('settings'), data.get('revision'))
-            elif self.path == '/api/recreate':
-                result = self.server.store.recreate(data.get('revision'))
-            elif self.path == '/api/host-token':
-                if set(data) != {'token', 'revision'}:
-                    raise ValueError('Supply exactly token and revision')
-                result = self.server.store.set_host_token(data['token'], data['revision'])
-            elif self.path == '/api/restart':
-                self.server.restart(); self.respond(200, {'ok': True}); return
-            else: self.respond(404, {'error': 'Not found'}); return
-            self.respond(200, self.state(result))
-        except Conflict as exc: self.respond(409, {'error': str(exc)})
+            with self.server.write_lock:
+                if self.path == '/api/video-output':
+                    if set(data) != {'mode', 'revision'}:
+                        raise ValueError('Supply exactly mode and revision')
+                    result = self.server.output_store.save(data['mode'], data['revision'])
+                    self.respond(200, self.output_state(result)); return
+                elif self.path == '/api/settings':
+                    result = self.server.store.save(data.get('settings'), data.get('revision'))
+                elif self.path == '/api/recreate':
+                    result = self.server.store.recreate(data.get('revision'))
+                elif self.path == '/api/host-token':
+                    if set(data) != {'token', 'revision'}:
+                        raise ValueError('Supply exactly token and revision')
+                    result = self.server.store.set_host_token(data['token'], data['revision'])
+                elif self.path == '/api/restart':
+                    self.server.restart(); self.respond(200, {'ok': True}); return
+                else: self.respond(404, {'error': 'Not found'}); return
+                self.respond(200, self.state(result))
+        except (Conflict, OutputConflict) as exc: self.respond(409, {'error': str(exc)})
         except (ValueError, UnicodeError): self.respond(400, {'error': 'Invalid settings or request'})
         except (OSError, subprocess.SubprocessError): self.respond(500, {'error': 'Operation failed; check service permissions'})
 

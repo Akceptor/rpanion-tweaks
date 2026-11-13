@@ -6,6 +6,8 @@
 
 import argparse
 import signal
+import sys
+from video_output import read_output_mode
 from video_stream_state import (StatePublisher, VideoSource,
     effective_codec, mount_name, port_number, rtp_destinations)
 import platform
@@ -1077,6 +1079,9 @@ def getPipeline(device, height, width, bitrate, format, rotation, framerate, tim
             if compression == "H264":
                 # Use multiple threads for software encoding
                 pipeline.append("x264enc tune=zerolatency bitrate={0} speed-preset=superfast key-int-max=25 threads=0".format(bitrate))
+                # WebRTC mandates Constrained Baseline; High profile support and
+                # recovery vary between browser hardware/software decoders.
+                pipeline.append("video/x-h264,profile=constrained-baseline")
             elif compression == "H265":
                 pipeline.append("x265enc tune=zerolatency bitrate={0} speed-preset=superfast key-int-max=25".format(bitrate))
 
@@ -1116,6 +1121,7 @@ class MyFactory(GstRtspServer.RTSPMediaFactory):
         self.set_latency(0)  # Minimize latency
         self.set_buffer_size(0)  # Use default but don't accumulate
         self.set_transport_mode(GstRtspServer.RTSPTransportMode.PLAY)
+        self.set_eos_shutdown(True)
 
     def do_create_element(self, url):
         pipeline_str = getPipeline(self.device, self.height, self.width, self.bitrate, self.format, self.rotation,
@@ -1123,9 +1129,8 @@ class MyFactory(GstRtspServer.RTSPMediaFactory):
         return Gst.parse_launch(pipeline_str)
 
     def do_configure(self, media):
-        # Configure the media for each client connection
-        # This is called when a client connects
-        self.set_eos_shutdown(True)  # Clean shutdown on EOS
+        # The base virtual method copies shared/latency/clock settings to media.
+        GstRtspServer.RTSPMediaFactory.do_configure(self, media)
 
         timer = attach_stats(media.get_element())
         if timer is not None:
@@ -1133,13 +1138,17 @@ class MyFactory(GstRtspServer.RTSPMediaFactory):
 
 
 class GstServer():
-    def __init__(self):
+    def __init__(self, address='0.0.0.0', service='8554'):
         self.server = GstRtspServer.RTSPServer()
+        self.server.set_address(address)
+        self.server.set_service(service)
 
         # Configure server for low-latency streaming
         self.server.set_backlog(5)  # Limit queued connections
 
         self.sourceID = self.server.attach(None)
+        if not self.sourceID:
+            raise RuntimeError('RTSP server could not bind its listening socket')
         print("Server available on rtsp://<IP>:8554")
 
     def addStream(self, device, h, w, bitrate, format, rotation, framerate, timestamp, compression):
@@ -1147,9 +1156,8 @@ class GstServer():
                       rotation, framerate, timestamp,
                       compression)
 
-        # Don't share the media pipeline - each client gets their own
-        # This prevents one slow client from affecting others
-        f.set_shared(False)
+        # WebRTC and native RTSP viewers must share the camera device/encoder.
+        f.set_shared(True)
 
         # Enable clock synchronization for smoother playback
         f.set_clock(None)  # Use default system clock
@@ -1163,7 +1171,7 @@ class GstServer():
               name + " latency=0 ! queue ! decodebin ! autovideosink sync=false")
 
 
-def video_options(args, env):
+def video_options(args, env, output_mode='both'):
     local = env.get("RPANION_WEBRTC_RTP_PORT")
     local = None if local is None else port_number(local)
     path = env.get("RPANION_VIDEO_STATE_FILE")
@@ -1174,22 +1182,23 @@ def video_options(args, env):
             print("Automatic video following is unsupported for multirtsp", flush=True)
         return local, None
     if args.transport == "RTP":
-        rtp_destinations(args.udp, local)  # Validate before starting the camera.
-        if path and local is None:
+        rtp_destinations(args.udp, local, output_mode)  # Validate before starting the camera.
+        if path and local is None and output_mode != 'rpanion':
             raise ValueError("RTP state publication requires RPANION_WEBRTC_RTP_PORT")
     return local, path
 
 
-def describe_video(args, local_port):
+def describe_video(args, local_port, output_mode='both'):
     codec = effective_codec(args.format, args.compression)
+    selection = dict(webrtc_enabled=output_mode != 'rpanion', output_mode=output_mode)
     if args.transport == "RTP":
-        return VideoSource("pending", "RTP", codec, "127.0.0.1", local_port)
+        return VideoSource("pending", "RTP", codec, "127.0.0.1", local_port, **selection)
     return VideoSource("pending", "RTSP", codec,
-                       rtsp_url="rtsp://127.0.0.1:8554/" + mount_name(args.videosource))
+                       rtsp_url="rtsp://127.0.0.1:8554/" + mount_name(args.videosource), **selection)
 
 
-def build_rtp_pipeline(args, local_port):
-    destinations = rtp_destinations(args.udp, local_port)
+def build_rtp_pipeline(args, local_port, output_mode='both'):
+    destinations = rtp_destinations(args.udp, local_port, output_mode)
     options = (args.videosource, args.height, args.width, args.bitrate,
                args.format, args.rotation, args.fps, args.timestamp, args.compression)
     if len(destinations) > 1:
@@ -1226,9 +1235,11 @@ def build_rtp_pipeline(args, local_port):
     return pipeline
 
 
-def run_video(loop, pipeline=None, publisher=None):
+def run_video(loop, pipeline=None, publisher=None, output_mode=None):
     """Own the GLib timers, state publication and RTP pipeline until shutdown."""
     timers, errors = [], []
+    restart_requested = False
+    output_error_logged = False
 
     def stop():
         loop.quit()
@@ -1250,6 +1261,21 @@ def run_video(loop, pipeline=None, publisher=None):
             errors.append(RuntimeError(message.parse_error()[0].message))
         return stop()
 
+    def poll_output():
+        nonlocal restart_requested, output_error_logged
+        try:
+            requested = read_output_mode()
+        except (ValueError, OSError):
+            if not output_error_logged:
+                print('Invalid video output setting; retaining current outputs', flush=True)
+                output_error_logged = True
+            return True
+        output_error_logged = False
+        if requested != output_mode:
+            restart_requested = True
+            return stop()
+        return True
+
     try:
         for signum in (signal.SIGTERM, signal.SIGINT):
             timers.append(GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum, stop))
@@ -1261,9 +1287,12 @@ def run_video(loop, pipeline=None, publisher=None):
         if publisher is not None:
             publisher.refresh()  # Configuration/permissions errors fail visibly at startup.
             timers.append(GLib.timeout_add_seconds(1, refresh))
+        if output_mode is not None:
+            timers.append(GLib.timeout_add_seconds(1, poll_output))
         loop.run()
         if errors:
             raise errors[0]
+        return restart_requested
     finally:
         for timer in timers:
             # A callback returning False already removed its own source.
@@ -1302,7 +1331,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     try:
-        local_port, state_path = video_options(args, os.environ)
+        output_mode = 'both' if args.multirtsp else read_output_mode()
+        local_port, state_path = video_options(args, os.environ, output_mode)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -1327,15 +1357,19 @@ if __name__ == '__main__':
             s.addStream(videosource, height, width, bitrate, formatstr, rotation, fps,
                         timestamp, args.compression)
     elif args.transport == "RTSP":
-        s = GstServer()
+        s = GstServer('127.0.0.1' if output_mode == 'webrtc' else '0.0.0.0')
         s.addStream(args.videosource, args.height, args.width, args.bitrate,
                     args.format, args.rotation, args.fps, args.timestamp, args.compression)
     else:
-        pipeline = build_rtp_pipeline(args, local_port)
-        print("Server sending UDP stream to " + args.udp, flush=True)
-        if local_port is not None:
+        pipeline = build_rtp_pipeline(args, local_port, output_mode)
+        if output_mode != 'webrtc':
+            print("Server sending UDP stream to " + args.udp, flush=True)
+        if local_port is not None and output_mode != 'rpanion':
             print("WebRTC local RTP copy on 127.0.0.1:" + str(local_port), flush=True)
 
     if state_path:
-        publisher = StatePublisher(state_path, describe_video(args, local_port))
-    run_video(loop, pipeline, publisher)
+        publisher = StatePublisher(state_path, describe_video(args, local_port, output_mode))
+    if run_video(loop, pipeline, publisher, None if args.multirtsp else output_mode):
+        # Keep the Rpanion-owned PID, command-line options and stdout/stderr pipes.
+        # run_video has released the old camera and retired its producer state.
+        os.execv(sys.executable, [sys.executable, *sys.argv])

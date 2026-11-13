@@ -429,12 +429,14 @@ On the Pi:
 ```bash
 wget -O ~/video-server.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/video-server.py
 wget -O ~/video_stream_state.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/video_stream_state.py
+wget -O ~/video_output.py https://raw.githubusercontent.com/Akceptor/rpanion-tweaks/main/python/video_output.py
 
 cd /usr/share/rpanion-server/app/python
 sudo cp video-server.py video-server.py.orig        # backup
 sudo cp ~/video_stream_state.py video_stream_state.py
+sudo cp ~/video_output.py video_output.py
 sudo cp ~/video-server.py video-server.py
-sudo chown rpanion:rpanion video-server.py video_stream_state.py
+sudo chown rpanion:rpanion video-server.py video_stream_state.py video_output.py
 sudo systemctl restart rpanion-server
 ```
 
@@ -565,6 +567,20 @@ the existing value. Normal settings changes and code recreation also preserve it
 Use the same value for the Worker's `FLY_HOST_TOKEN` secret. Room-link recipients
 do not need this secret or an extra login.
 
+**Video output** is a separate selector: **WebRTC only**, **RTP only** or **RTSP
+only** (matching the current Rpanion transport), and **Both**. If the camera state
+is unavailable it shows **RTP/RTSP only**. **Apply video output** saves the choice
+in `/var/lib/rpanion-video/output.json`; the camera checks it each second and
+briefly restarts to apply a change. The page distinguishes the saved choice from
+fresh camera confirmation, and shows pending or unavailable state as appropriate.
+An active browser may need **Refresh connection** afterward. Native-only mode
+keeps browser control and data channels but disables browser video. The configured
+Rpanion camera destination is preserved. Missing configuration defaults to Both;
+malformed configuration is rejected. Multi-RTSP output selection is unsupported.
+This selector requires the updated camera producer, state contract and bridge
+from the video-following installation below; copying the settings page alone does
+not upgrade the camera or bridge.
+
 The service has no login and is intended for the operator's trusted private or
 ZeroTier network. The default bind is `0.0.0.0:4001`; use `--host` with the Pi's
 ZeroTier address to limit it to that interface. It serves only bundled assets,
@@ -589,8 +605,10 @@ cd "$settings_src"
 Install the settings server and page:
 
 ```sh
-sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_settings.html python/fly_ground_config.py python/video_stream_state.py /opt/fly-ground/python/
+sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_settings.html python/fly_ground_config.py python/fly_ground_auth.py python/video_stream_state.py python/video_output.py /opt/fly-ground/python/
 sudo install -d -m 0700 /var/lib/fly-ground-settings
+sudo install -d -m 0755 /var/lib/rpanion-video
+sudo install -o rpanion -g rpanion -m 0644 python/video_output.py /usr/share/rpanion-server/app/python/
 ```
 
 Move the existing configuration into the writable state directory, keeping the
@@ -642,7 +660,12 @@ to activate saved changes; it disconnects the current driving session.
 The service uses Python's standard
 library; no additional packages are needed. The unit runs as root to read the
 private environment file and restart the fixed `fly-ground.service` unit. Its
-filesystem writes are confined to `/var/lib/fly-ground-settings`. Configuration
+filesystem writes are confined to `/var/lib/fly-ground-settings` and
+`/var/lib/rpanion-video`. The former stays mode 0700 for the private environment
+file; the installation command creates the separate video directory mode 0755
+so the camera can traverse it. The directory persists across reboots and must
+exist before starting the settings service. Video preferences are
+atomic JSON writes with mode 0644 and contain no secrets. Configuration
 writes preserve file owner/group and mode 0600. Other environment keys and
 comments are preserved; unsupported environment-file syntax is rejected instead
 of being evaluated as shell code.
@@ -703,7 +726,7 @@ From this repository's root, install the shared module **before** either script
 that imports it:
 
 ```sh
-sudo install -o rpanion -g rpanion -m 0644 python/video_stream_state.py /usr/share/rpanion-server/app/python/
+sudo install -o rpanion -g rpanion -m 0644 python/video_stream_state.py python/video_output.py /usr/share/rpanion-server/app/python/
 sudo cp -a python/. /opt/fly-ground/python/
 sudo install -o rpanion -g rpanion -m 0755 python/video-server.py /usr/share/rpanion-server/app/python/video-server.py
 sudo install -d -m 0755 /etc/systemd/system/rpanion-server.service.d

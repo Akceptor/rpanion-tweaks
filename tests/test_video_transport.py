@@ -69,6 +69,42 @@ class TransportTest(unittest.TestCase):
                          [unittest.mock.call('host', '127.0.0.1'), unittest.mock.call('port', 5601)])
         self.assertNotIn('payload', camera.call_args.kwargs)
 
+    def test_single_output_modes_bypass_splitter_without_changing_destination(self):
+        for mode, host, port in (('webrtc', '127.0.0.1', 5601), ('rpanion', '192.0.2.1', 5600)):
+            sink, pipeline = Mock(), Mock()
+            pipeline.get_by_name.return_value = sink
+            args = self.args()
+            with patch.object(vs, 'getPipeline', return_value='camera'), \
+                    patch.object(vs.Gst, 'parse_launch', return_value=pipeline) as launch:
+                vs.build_rtp_pipeline(args, 5601, mode)
+            self.assertNotIn('tee', launch.call_args.args[0])
+            sink.set_property.assert_any_call('host', host)
+            sink.set_property.assert_any_call('port', port)
+            self.assertEqual(args.udp, '192.0.2.1:5600')
+
+    def test_native_only_state_keeps_transport_but_disables_webrtc_video(self):
+        for transport in ('RTP', 'RTSP'):
+            source = vs.describe_video(self.args(transport=transport), 5601, 'rpanion')
+            self.assertEqual(source.transport, transport)
+            self.assertFalse(source.webrtc_enabled)
+            self.assertEqual(source.output_mode, 'rpanion')
+
+    def test_rtsp_web_only_binds_loopback_and_shared_camera(self):
+        server, factory = Mock(), Mock()
+        with patch.object(vs.GstRtspServer, 'RTSPServer', return_value=server), \
+                patch.object(vs, 'MyFactory', return_value=factory):
+            rtsp = vs.GstServer('127.0.0.1')
+            rtsp.addStream('/dev/video0', 480, 640, 500, 'image/jpeg', 0, 25, False, 'H264')
+        server.set_address.assert_called_once_with('127.0.0.1')
+        factory.set_shared.assert_called_once_with(True)
+
+    def test_rtsp_bind_failure_cannot_publish_an_applied_mode(self):
+        server = Mock()
+        server.attach.return_value = 0
+        with patch.object(vs.GstRtspServer, 'RTSPServer', return_value=server):
+            with self.assertRaisesRegex(RuntimeError, 'RTSP.*bind'):
+                vs.GstServer('127.0.0.1')
+
     def test_preencoded_h265_uses_h265_access_units_and_payloaders(self):
         pipeline = Mock()
         with patch.object(vs, 'getPipeline', return_value='camera'), \
@@ -81,6 +117,29 @@ class TransportTest(unittest.TestCase):
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_output_change_requests_restart_after_clean_shutdown(self):
+        pipeline, publisher, loop, glib = Mock(), Mock(), Mock(), Mock()
+        callbacks = []
+        glib.timeout_add_seconds.side_effect = lambda _seconds, callback: callbacks.append(callback) or 4
+        loop.run.side_effect = lambda: callbacks[-1]()
+        with patch.object(vs, 'GLib', glib), patch.object(vs, 'attach_stats'), \
+                patch.object(vs, 'read_output_mode', return_value='webrtc'):
+            restart = vs.run_video(loop, pipeline, publisher, output_mode='both')
+        self.assertTrue(restart)
+        loop.quit.assert_called_once()
+        publisher.close.assert_called_once()
+        self.assertEqual(pipeline.set_state.call_args_list[-1], unittest.mock.call(vs.Gst.State.NULL))
+
+    def test_invalid_output_file_leaves_camera_running(self):
+        loop, glib = Mock(), Mock()
+        callbacks = []
+        glib.timeout_add_seconds.side_effect = lambda _seconds, callback: callbacks.append(callback) or 4
+        loop.run.side_effect = lambda: self.assertTrue(callbacks[-1]())
+        with patch.object(vs, 'GLib', glib), \
+                patch.object(vs, 'read_output_mode', side_effect=ValueError('invalid')):
+            self.assertFalse(vs.run_video(loop, output_mode='both'))
+        loop.quit.assert_not_called()
+
     def test_failed_heartbeat_stops_pipeline_and_removes_state(self):
         pipeline, publisher, loop = Mock(), Mock(), Mock()
         publisher.refresh.side_effect = [True, OSError('read-only runtime directory')]
