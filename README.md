@@ -662,8 +662,9 @@ library; no additional packages are needed. The unit runs as root to read the
 private environment file and restart the fixed `fly-ground.service` unit. Its
 filesystem writes are confined to `/var/lib/fly-ground-settings` and
 `/var/lib/rpanion-video`. The former stays mode 0700 for the private environment
-file; systemd creates both directories before sandbox setup and makes only the
-video directory mode 0755 so the camera can traverse it. Video preferences are
+file; the installation command creates the separate video directory mode 0755
+so the camera can traverse it. The directory persists across reboots and must
+exist before starting the settings service. Video preferences are
 atomic JSON writes with mode 0644 and contain no secrets. Configuration
 writes preserve file owner/group and mode 0600. Other environment keys and
 comments are preserved; unsupported environment-file syntax is rejected instead
