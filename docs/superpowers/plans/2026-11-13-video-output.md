@@ -46,5 +46,13 @@ session untouched while developing and testing in temporary directories.
   failures were not proven to be caused by that mechanism.
 - Native visual preview was not completed: Chrome was in use and the separate
   browser host was unavailable. API, markup and JavaScript behavior were checked.
-- Implementation is committed on the feature branch; production deployment and
-  live camera/phone acceptance of the new selector remain separate work.
+- Deployed to the Pi on 2026-11-13 at revision `3b868b3`, including permission
+  correction after a guarded rollback of the first attempt. Systemd reapplies
+  StateDirectoryMode for command startup, so the non-secret video directory is
+  provisioned separately at 0755; the private settings directory stays 0700.
+  Release marker: `/var/lib/rpanion-video-output-release.json`. Backup:
+  `/var/backups/rpanion-video-output/20261113T093636Z`.
+- Live settings page/API and all three services verified. Both outputs remain
+  selected with RTP, applied and not pending. Passive source sample: 23.11 fps,
+  maximum gap 84 ms. Camera settings, credentials and unrelated services were
+  preserved. Browser/phone acceptance after this deployment remains unverified.
