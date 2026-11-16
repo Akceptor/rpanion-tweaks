@@ -22,6 +22,12 @@
 <button id="copyLink" type="button" disabled>Copy connection link</button>
 <p id="recreateHint" class="hint">The running session keeps its current code until the bridge restarts.</p>
 </section>
+<section class="card" aria-labelledby="servicesHeading">
+<h2 id="servicesHeading">Services</h2>
+<p class="muted">Service controls remain available while editing settings. Status checks preserve unsaved edits.</p>
+<p class="hint">Restarting Rpanion disconnects video and telemetry. Restarting Rpanion or Lima stops the dependent bridge; restart restores a bridge that was running. Stopping either also stops the bridge. Starting either alone may require starting the bridge afterward. Video and router recovery is through Rpanion.</p>
+<div id="servicesList"></div><p id="servicesStatus" class="hint" role="status">Checking services…</p>
+</section>
 <form id="settingsForm" autocomplete="off">
 <section class="card">
 <div class="form-head"><h2>Saved settings</h2><div class="actions"><button id="edit" type="button" disabled>Edit settings</button><button id="save" class="primary" type="submit" hidden disabled>Save changes</button><button id="cancel" type="button" hidden disabled>Cancel</button></div></div>
@@ -79,13 +85,14 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const inputs = [...document.querySelectorAll('#settingsForm input[name]')];
+let serviceSnapshot = null, serviceBusy = false, servicePolling = false, serviceGeneration = 0, serviceUpdatedAt = 0;
 let outputSnapshot = null, outputRevision = null;
 let snapshot = null, token = null, editing = false, busy = false, pendingRestart = false;
 function status(text, kind = '') { $('status').textContent = text; $('status').className = kind; }
 function formSettings() { return Object.fromEntries(inputs.map(input => [input.name, input.value])); }
 function dirty() { return editing && snapshot && inputs.some(input => input.value !== String(snapshot.settings[input.name] ?? '')); }
 function controls() {
-  const ready = !!snapshot && !busy;
+  const ready = !!snapshot && !busy && !serviceBusy;
   $('modeBadge').textContent = editing ? 'Editing' : 'Read only';
   $('modeBadge').classList.toggle('editing', editing);
   inputs.forEach(input => { input.readOnly = !editing || busy; });
@@ -105,6 +112,7 @@ function controls() {
   $('nativeRouteLabel').textContent = transport;
   const destinations = output === 'webrtc' ? 'the browser through WebRTC' : output === 'rpanion' ? `a video client through ${transport}` : `the browser through WebRTC and a video client through ${transport}`;
   $('outputRoutes').setAttribute('aria-label', `Selected destinations: camera video goes to ${destinations}.`);
+  document.querySelectorAll('#servicesList button').forEach(button => { button.disabled = busy || serviceBusy || !serviceSnapshot; });
   $('pending').hidden = !pendingRestart;
   $('recreateHint').textContent = editing ? 'Save or cancel edits before recreating the code or restarting.' : 'The running session keeps its current code until the bridge restarts.';
 }
@@ -143,17 +151,98 @@ function renderOutput(data, replaceSelection = false) {
     : `Applied: ${labels[data.applied_mode] || 'unknown'}.`;
   controls();
 }
+function renderServices(data) {
+  if (!data || !Array.isArray(data.services) || data.services.length !== 6 || typeof data.token !== 'string') throw new Error('Invalid services response.');
+  const ids = ['rpanion','video','bridge','router','lima','agps'];
+  if (!data.services.every((row, index) => row.id === ids[index] && typeof row.label === 'string' && typeof row.detail === 'string' && ['up','down','starting','stopping','unknown'].includes(row.state) && Array.isArray(row.actions) && row.actions.every(action => ['start','stop','restart'].includes(action)))) throw new Error('Invalid services response.');
+  serviceSnapshot = data; serviceUpdatedAt = Date.now(); token = data.token;
+  const list = $('servicesList');
+  data.services.forEach(row => {
+    let item = document.getElementById('service-' + row.id);
+    if (!item) {
+      item = document.createElement('div'); item.id = 'service-' + row.id; item.className = 'row'; item.style.cssText = 'padding:14px 0;border-bottom:1px solid var(--line)';
+      const info = document.createElement('div'); info.className = 'grow';
+      const title = document.createElement('strong'); title.dataset.part = 'title'; info.append(title);
+      const detail = document.createElement('div'); detail.className = 'hint'; detail.dataset.part = 'detail'; info.append(detail); item.append(info);
+      const actions = document.createElement('div'); actions.className = 'actions';
+      row.actions.forEach(action => {
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = action[0].toUpperCase() + action.slice(1); button.setAttribute('aria-label', button.textContent + ' ' + row.label);
+        button.onclick = () => serviceAction(row.id, action); actions.append(button);
+      }); item.append(actions); list.append(item);
+    }
+    item.querySelector('[data-part="title"]').textContent = row.label + ' — ' + row.state.toUpperCase();
+    item.querySelector('[data-part="detail"]').textContent = row.detail;
+  });
+  controls();
+}
+async function serviceAction(service, action) {
+  expireServices();
+  if (document.hidden || busy || serviceBusy || !serviceSnapshot) return;
+  const generation = ++serviceGeneration; serviceBusy = true; controls(); $('servicesStatus').textContent = 'Applying service action…';
+  try {
+    const data = await api('/api/services', {service, action});
+    if (generation !== serviceGeneration || document.hidden) return;
+    renderServices(data);
+    $('servicesStatus').textContent = 'Service action completed. Status reflects the latest check.';
+    if (service === 'bridge' && action === 'restart') { pendingRestart = false; controls(); }
+  } catch (error) {
+    if (generation === serviceGeneration) invalidateServices(error.message || 'Service action failed; refresh status before retrying.');
+  }
+  finally { serviceBusy = false; controls(); }
+}
+async function pollServices() {
+  expireServices();
+  if (document.hidden || servicePolling || serviceBusy || busy) return;
+  servicePolling = true;
+  const generation = serviceGeneration;
+  try {
+    const data = await api('/api/services');
+    if (!serviceBusy && generation === serviceGeneration) { renderServices(data); $('servicesStatus').textContent = 'Service status updated.'; }
+  } catch (error) {
+    if (serviceBusy || generation !== serviceGeneration) return;
+    invalidateServices(error.message || 'Service status unavailable.');
+  } finally { servicePolling = false; }
+}
+function invalidateServices(message) {
+  serviceSnapshot = null; serviceUpdatedAt = 0;
+  document.querySelectorAll('#servicesList [data-part="title"]').forEach(title => { title.textContent = title.textContent.split(' — ')[0] + ' — UNKNOWN'; });
+  document.querySelectorAll('#servicesList [data-part="detail"]').forEach(detail => { detail.textContent = 'Current health is unavailable. Refreshing service status is required before another action.'; });
+  $('servicesStatus').textContent = message; controls();
+}
+function expireServices() {
+  if (serviceSnapshot && Date.now() - serviceUpdatedAt >= 15000) {
+    invalidateServices('Service status expired. Checking current health before another action.');
+  }
+}
+function resumeServices() {
+  serviceGeneration++;
+  invalidateServices('Page visibility changed. Checking current service health.');
+  if (!document.hidden) pollServices();
+}
 async function api(path, payload) {
   const options = {cache:'no-store', credentials:'same-origin', headers:{Accept:'application/json'}};
   if (payload !== undefined) {
     if (!token) throw new Error('Missing request token. Reload the page before making changes.');
     options.method = 'POST'; options.headers['Content-Type'] = 'application/json'; options.headers['X-CSRF-Token'] = token; options.body = JSON.stringify(payload);
   }
-  const response = await fetch(path, options);
-  let data;
-  try { data = await response.json(); } catch { throw new Error('The settings server returned an unreadable response.'); }
-  if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : `Request failed (${response.status}).`);
-  return data;
+  const request = async () => {
+    const response = await fetch(path, options);
+    let data;
+    try { data = await response.json(); } catch { throw new Error('The settings server returned an unreadable response.'); }
+    if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : `Request failed (${response.status}).`);
+    return data;
+  };
+  if (path !== '/api/services') return request();
+  const controller = new AbortController(); options.signal = controller.signal;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error('Service request timed out; refresh status before retrying.'));
+      controller.abort();
+    }, payload === undefined ? 8000 : 65000);
+  });
+  try { return await Promise.race([request(), timeout]); }
+  finally { clearTimeout(timer); }
 }
 async function perform(action) {
   if (busy) return;
@@ -191,6 +280,11 @@ $('copyLink').onclick = async () => {
   catch { status('Clipboard is unavailable here. Select and copy the connection link above.'); }
 };
 window.addEventListener('beforeunload', event => { if (dirty()) { event.preventDefault(); event.returnValue = ''; } });
+pollServices();
+setInterval(pollServices, 3000);
+setInterval(expireServices, 1000);
+document.addEventListener('visibilitychange', resumeServices);
+window.addEventListener('pageshow', resumeServices);
 perform(async () => { render(await api('/api/settings')); renderOutput(await api('/api/video-output')); status('Settings are read-only. Choose Edit settings to make changes.'); });
 setInterval(async () => {
   if (busy || editing || !snapshot) return;

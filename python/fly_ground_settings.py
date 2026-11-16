@@ -15,11 +15,13 @@ import secrets
 import subprocess
 import tempfile
 import threading
+from urllib.parse import urlsplit
 
 from fly_ground_config import Settings
 from fly_ground_auth import validate_host_token
 from video_output import VideoOutputStore, Conflict as OutputConflict
 from video_stream_state import read_state
+from fly_ground_services import ServiceManager, Busy
 
 FIELDS = {
     'FLY_ROOM_CODE': 'code', 'FLY_SITE_URL': 'site_url', 'FLY_RTSP_URL': 'rtsp_url',
@@ -82,6 +84,23 @@ class ConfigStore:
         return raw, {'settings': normalized(parse_env(raw)),
                      'host_token_configured': host_token_configured(raw),
                      'revision': hashlib.sha256(raw).hexdigest()}
+
+    def site_origin(self):
+        # Service recovery must work even when an unrelated setting is invalid.
+        try:
+            with self.lock:
+                site = parse_env(self.path.read_bytes(), {'FLY_SITE_URL'}).get('FLY_SITE_URL', '').rstrip('/')
+            parsed = urlsplit(site)
+            if (parsed.scheme != 'https' or not parsed.hostname or parsed.username
+                    or parsed.password or parsed.path or parsed.query or parsed.fragment):
+                return None
+            host = parsed.hostname.lower()
+            if ':' in host:
+                host = '[' + host + ']'
+            port = parsed.port
+            return 'https://' + host + (':' + str(port) if port not in (None, 443) else '')
+        except (OSError, ValueError, UnicodeError):
+            return None
 
     def read(self):
         with self.lock:
@@ -159,8 +178,9 @@ def restart_service():
 
 class SettingsServer(ThreadingHTTPServer):
     daemon_threads = True
-    def __init__(self, address, store, restart=restart_service, output_store=None):
+    def __init__(self, address, store, restart=restart_service, output_store=None, services=None):
         self.store, self.restart = store, restart
+        self.services = services if services is not None else ServiceManager()
         self.output_store = output_store if output_store is not None else VideoOutputStore()
         self.write_lock = threading.RLock()
         self.token = secrets.token_urlsafe(32)
@@ -184,6 +204,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Referrer-Policy', 'no-referrer')
+        if getattr(self, 'cors_origin', None):
+            self.send_header('Access-Control-Allow-Origin', self.cors_origin)
+            self.send_header('Vary', 'Origin')
+            if self.command == 'OPTIONS':
+                self.send_header('Access-Control-Allow-Methods', 'GET, POST')
+                self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token')
         self.end_headers(); self.wfile.write(body)
 
     def state(self, result=None):
@@ -197,10 +223,33 @@ class Handler(BaseHTTPRequestHandler):
                     applied_mode=applied, running=source is not None,
                     pending=saved["mode"] != applied if source is not None else None)
 
+    def service_origin_allowed(self):
+        origin = self.headers.get('Origin')
+        if origin is None:
+            return self.headers.get('Sec-Fetch-Site') != 'cross-site'
+        if origin == 'http://' + self.headers.get('Host', ''):
+            return True
+        if origin == self.server.store.site_origin():
+            self.cors_origin = origin
+            return True
+        return False
+
+    def do_OPTIONS(self):
+        requested = {header.strip().lower() for header in self.headers.get('Access-Control-Request-Headers', '').split(',') if header.strip()}
+        if (self.path != '/api/services'
+                or self.headers.get('Access-Control-Request-Method') not in ('GET', 'POST')
+                or not requested <= {'content-type', 'x-csrf-token'}
+                or not self.service_origin_allowed()):
+            self.respond(403, {'error': 'Request denied'}); return
+        self.respond(204, b'', 'text/plain')
+
     def do_GET(self):
+        if self.path == '/api/services' and not self.service_origin_allowed():
+            self.respond(403, {'error': 'Request denied'}); return
         try:
             if self.path == '/':
                 self.respond(200, Path(__file__).with_name('fly_ground_settings.html').read_bytes(), 'text/html; charset=utf-8')
+            elif self.path == '/api/services': self.respond(200, dict(self.server.services.read(), token=self.server.token))
             elif self.path == '/api/settings': self.respond(200, self.state())
             elif self.path == '/api/video-output': self.respond(200, self.output_state())
             else: self.respond(404, {'error': 'Not found'})
@@ -209,8 +258,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         origin = self.headers.get('Origin')
         expected = 'http://' + self.headers.get('Host', '')
-        if (self.headers.get('Sec-Fetch-Site') == 'cross-site'
-                or (origin is not None and origin != expected)
+        origin_allowed = (self.service_origin_allowed() if self.path == '/api/services'
+                          else self.headers.get('Sec-Fetch-Site') != 'cross-site'
+                          and (origin is None or origin == expected))
+        if (not origin_allowed
                 or not secrets.compare_digest(self.headers.get('X-CSRF-Token', ''), self.server.token)):
             self.respond(403, {'error': 'Request denied'}); return
         if self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json':
@@ -220,6 +271,11 @@ class Handler(BaseHTTPRequestHandler):
             if length <= 0 or length > 16384: raise ValueError('Invalid request size')
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict): raise ValueError('JSON object required')
+            if self.path == '/api/services':
+                if set(data) != {'service', 'action'}:
+                    raise ValueError('Supply exactly service and action')
+                result = self.server.services.operate(data['service'], data['action'])
+                self.respond(200, dict(result, token=self.server.token)); return
             with self.server.write_lock:
                 if self.path == '/api/video-output':
                     if set(data) != {'mode', 'revision'}:
@@ -235,12 +291,21 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('Supply exactly token and revision')
                     result = self.server.store.set_host_token(data['token'], data['revision'])
                 elif self.path == '/api/restart':
-                    self.server.restart(); self.respond(200, {'ok': True}); return
+                    if not self.server.services.operation_lock.acquire(blocking=False):
+                        raise Busy('Another service operation is in progress; retry shortly')
+                    try:
+                        self.server.restart()
+                    finally:
+                        self.server.services.operation_lock.release()
+                    self.respond(200, {'ok': True}); return
                 else: self.respond(404, {'error': 'Not found'}); return
                 self.respond(200, self.state(result))
-        except (Conflict, OutputConflict) as exc: self.respond(409, {'error': str(exc)})
+        except (Conflict, OutputConflict, Busy) as exc: self.respond(409, {'error': str(exc)})
         except (ValueError, UnicodeError): self.respond(400, {'error': 'Invalid settings or request'})
-        except (OSError, subprocess.SubprocessError): self.respond(500, {'error': 'Operation failed; check service permissions'})
+        except (OSError, subprocess.SubprocessError):
+            message = ('Service operation failed or timed out; refresh status before retrying'
+                       if self.path == '/api/services' else 'Operation failed; check service permissions')
+            self.respond(500, {'error': message})
 
 
 def main():
