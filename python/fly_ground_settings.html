@@ -112,7 +112,12 @@ function controls() {
   $('nativeRouteLabel').textContent = transport;
   const destinations = output === 'webrtc' ? 'the browser through WebRTC' : output === 'rpanion' ? `a video client through ${transport}` : `the browser through WebRTC and a video client through ${transport}`;
   $('outputRoutes').setAttribute('aria-label', `Selected destinations: camera video goes to ${destinations}.`);
-  document.querySelectorAll('#servicesList button').forEach(button => { button.disabled = busy || serviceBusy || !serviceSnapshot; });
+  document.querySelectorAll('#servicesList button').forEach(button => {
+    const service = serviceSnapshot?.services.find(row => row.id === button.dataset.service);
+    const action = button.dataset.action;
+    const allowed = service?.actions.includes(action) && (service.state === 'down' ? action === 'start' : service.state === 'up' && action !== 'start');
+    button.disabled = busy || serviceBusy || !allowed;
+  });
   $('pending').hidden = !pendingRestart;
   $('recreateHint').textContent = editing ? 'Save or cancel edits before recreating the code or restarting.' : 'The running session keeps its current code until the bridge restarts.';
 }
@@ -167,6 +172,7 @@ function renderServices(data) {
       const actions = document.createElement('div'); actions.className = 'actions';
       row.actions.forEach(action => {
         const button = document.createElement('button'); button.type = 'button'; button.textContent = action[0].toUpperCase() + action.slice(1); button.setAttribute('aria-label', button.textContent + ' ' + row.label);
+        button.dataset.service = row.id; button.dataset.action = action;
         button.onclick = () => serviceAction(row.id, action); actions.append(button);
       }); item.append(actions); list.append(item);
     }

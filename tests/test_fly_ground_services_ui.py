@@ -7,6 +7,27 @@ import unittest
 
 @unittest.skipUnless(shutil.which('node'), 'requires Node')
 class ServicesUiTest(unittest.TestCase):
+    def test_start_stop_buttons_follow_current_service_state(self):
+        html = (Path(__file__).resolve().parents[1] / 'python' / 'fly_ground_settings.html').read_text()
+        functions = 'function controls(' + html.split('function controls(', 1)[1].split('function render(', 1)[0]
+        # Exercise the real control refresh, including updates on existing rows.
+        script = """
+const assert=require('node:assert/strict');
+const nodes=new Map(),$=id=>{if(!nodes.has(id))nodes.set(id,{value:'both',classList:{toggle(){}},dataset:{},setAttribute(){}});return nodes.get(id)};
+const buttons=['start','stop','restart'].map(action=>({dataset:{service:'bridge',action}}));
+const document={querySelectorAll:()=>buttons};
+let snapshot={},busy=false,serviceBusy=false,editing=false,pendingRestart=false,inputs=[],outputSnapshot=null;
+let serviceSnapshot={services:[]};
+""" + functions + """
+for(const [state,expected] of [['up',[true,false,false]],['down',[false,true,true]],['starting',[true,true,true]],['stopping',[true,true,true]],['unknown',[true,true,true]]]) {
+ serviceSnapshot.services=[{id:'bridge',state,actions:['start','stop','restart']}];
+ controls();assert.deepEqual(buttons.map(button=>button.disabled),expected,state);
+}
+serviceBusy=true;controls();assert.ok(buttons.every(button=>button.disabled));
+"""
+        result = subprocess.run(['node', '-e', script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_old_poll_cannot_replace_action_result_or_settings_edits(self):
         html = (Path(__file__).resolve().parents[1] / 'python' / 'fly_ground_settings.html').read_text()
         functions = 'async function serviceAction(' + html.split('async function serviceAction(', 1)[1].split('async function api(', 1)[0]
