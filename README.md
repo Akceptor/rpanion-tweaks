@@ -581,6 +581,23 @@ This selector requires the updated camera producer, state contract and bridge
 from the video-following installation below; copying the settings page alone does
 not upgrade the camera or bridge.
 
+The Services card reports Rpanion, the video producer, the WebRTC bridge, the
+MAVLink router, Lima and AGPS. Rpanion, bridge, Lima and AGPS support Start, Stop
+and Restart. The video row reports a fresh producer heartbeat, which does not
+prove that frames are flowing; the router row reports process health only.
+Recover these two components through Rpanion. Restarting Rpanion disconnects video
+and telemetry. Restarting Rpanion or Lima stops the dependent bridge and restores
+it only if it was already running. Stopping either also stops the bridge; starting
+either alone may require starting the bridge afterward.
+
+The cockpit can read and control `/api/services` directly from its configured
+`FLY_SITE_URL` HTTPS origin. Only that endpoint grants cross-origin access, and
+POST actions still require its CSRF token. Other settings APIs remain same-origin.
+Browsers may require local network access permission to reach the private HTTP
+address. Local settings and service recovery remain accessible even if saved
+bridge settings are invalid. Concurrent operations return a busy response; retry
+after the operation finishes. Service control does not use signaling.
+
 The service has no login and is intended for the operator's trusted private or
 ZeroTier network. The default bind is `0.0.0.0:4001`; use `--host` with the Pi's
 ZeroTier address to limit it to that interface. It serves only bundled assets,
@@ -605,7 +622,7 @@ cd "$settings_src"
 Install the settings server and page:
 
 ```sh
-sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_settings.html python/fly_ground_config.py python/fly_ground_auth.py python/video_stream_state.py python/video_output.py /opt/fly-ground/python/
+sudo install -m 0644 python/fly_ground_settings.py python/fly_ground_services.py python/fly_ground_settings.html python/fly_ground_config.py python/fly_ground_auth.py python/video_stream_state.py python/video_output.py /opt/fly-ground/python/
 sudo install -d -m 0700 /var/lib/fly-ground-settings
 sudo install -d -m 0755 /var/lib/rpanion-video
 sudo install -o rpanion -g rpanion -m 0644 python/video_output.py /usr/share/rpanion-server/app/python/

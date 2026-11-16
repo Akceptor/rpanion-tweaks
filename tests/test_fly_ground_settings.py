@@ -124,11 +124,85 @@ class HttpTest(StoreTest):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.getheader('Cache-Control'), 'no-store')
         self.assertIn('id="recreate"', body)
+        self.assertIn('id="servicesList"', body)
+        self.assertIn("api('/api/services'", body)
+        self.assertIn('Restarting Rpanion disconnects video and telemetry', body)
         self.assertIn('readonly', body)
         self.assertIn('id="hostToken" type="password"', body)
         self.assertIn('id="saveHostToken"', body)
         self.assertIn("api('/api/host-token'", body)
         conn.close()
+
+    def test_service_api_is_independent_allowlisted_and_protected(self):
+        from fly_ground_services import ServiceManager
+        self.server.services = ServiceManager(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout='inactive'), video_state=lambda: None)
+        status, state = self.request('GET', '/api/services')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(state['services']), 6)
+        headers = {'Content-Type': 'application/json', 'X-CSRF-Token': state['token']}
+        body = {'service': 'bridge', 'action': 'start'}
+        self.assertEqual(self.request('POST', '/api/services', body)[0], 403)
+        self.assertEqual(self.request('POST', '/api/services', body, dict(headers, Origin='http://evil.example'))[0], 403)
+        for bad in ({'service': 'bridge'}, dict(body, extra=True), dict(body, service='video'), dict(body, action='reload')):
+            self.assertEqual(self.request('POST', '/api/services', bad, headers)[0], 400)
+        self.assertEqual(self.request('POST', '/api/services', body, headers), (200, state))
+        self.server.services.operation_lock.acquire()
+        try:
+            self.assertEqual(self.request('POST', '/api/services', body, headers)[0], 409)
+            self.assertEqual(self.request('POST', '/api/restart', {}, headers)[0], 409)
+        finally: self.server.services.operation_lock.release()
+        # Services remain available even when the settings file is missing.
+        self.path.unlink()
+        self.assertEqual(self.request('GET', '/api/services')[0], 200)
+
+    def test_services_cors_is_limited_to_saved_site_and_endpoint(self):
+        from fly_ground_services import ServiceManager
+        self.server.services = ServiceManager(run=lambda *a, **k: SimpleNamespace(returncode=0, stdout='active'), video_state=lambda: None)
+        def call(method, path, headers, body=None):
+            conn = http.client.HTTPConnection(*self.server.server_address)
+            conn.request(method, path, None if body is None else json.dumps(body), headers)
+            response = conn.getresponse()
+            result = response.status, dict(response.getheaders()), response.read()
+            conn.close()
+            return result
+        allowed = {'Origin': 'https://example.com', 'Sec-Fetch-Site': 'cross-site'}
+        status, headers, body = call('GET', '/api/services', allowed)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get('Access-Control-Allow-Origin'), allowed['Origin'])
+        self.assertEqual(headers.get('Vary'), 'Origin')
+        token = json.loads(body)['token']
+        preflight = dict(allowed, **{'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type,x-csrf-token'})
+        status, headers, _ = call('OPTIONS', '/api/services', preflight)
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get('Access-Control-Allow-Methods'), 'GET, POST')
+        self.assertIn('X-CSRF-Token', headers.get('Access-Control-Allow-Headers', ''))
+        for bad in (dict(preflight, Origin='https://evil.example'), dict(preflight, **{'Access-Control-Request-Method': 'DELETE'}), dict(preflight, **{'Access-Control-Request-Headers': 'authorization'})):
+            status, headers, _ = call('OPTIONS', '/api/services', bad)
+            self.assertEqual(status, 403)
+            self.assertNotIn('Access-Control-Allow-Origin', headers)
+        self.assertEqual(call('OPTIONS', '/api/settings', preflight)[0], 403)
+        status, headers, body = call('GET', '/api/services', dict(allowed, Origin='https://evil.example'))
+        self.assertEqual(status, 403)
+        self.assertNotIn('token', json.loads(body))
+        post = dict(allowed, **{'Content-Type': 'application/json', 'X-CSRF-Token': token})
+        self.assertEqual(call('POST', '/api/services', post, {'service':'bridge','action':'start'})[0], 200)
+        self.assertEqual(call('POST', '/api/services', allowed, {'service':'bridge','action':'start'})[0], 403)
+        self.assertEqual(call('POST', '/api/restart', post, {})[0], 403)
+        # Invalid unrelated configuration must not prevent local recovery controls.
+        self.path.write_text('FLY_ROOM_CODE=bad\nFLY_SITE_URL=broken\n')
+        self.assertEqual(call('GET', '/api/services', {})[0], 200)
+        self.assertEqual(call('GET', '/api/services', allowed)[0], 403)
+
+    def test_services_failure_is_safe_and_refreshable(self):
+        import subprocess
+        from unittest.mock import Mock
+        self.server.services = Mock()
+        self.server.services.operate.side_effect = subprocess.TimeoutExpired('SECRET', 20)
+        headers = {'Content-Type':'application/json', 'X-CSRF-Token':self.server.token}
+        status, reply = self.request('POST', '/api/services', {'service':'bridge','action':'restart'}, headers)
+        self.assertEqual(status, 500)
+        self.assertIn('refresh status', reply['error'])
+        self.assertNotIn('SECRET', json.dumps(reply))
 
     def test_api_csrf_revision_and_restart(self):
         status, data = self.request('GET', '/api/settings')
