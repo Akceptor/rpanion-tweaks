@@ -80,7 +80,6 @@ class PeerProtocol:
         self.started_ms = now_ms
         self.last_pong_ms = now_ms
         self.arbiter.peer_connected = True
-        self.arbiter.request_disarm(now_ms)
         self.state(now_ms)
 
     def remaining(self, now_ms):

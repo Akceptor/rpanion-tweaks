@@ -62,10 +62,6 @@ class MavlinkAdapter:
         release = self.arbiter.take_release()
         if release is not None:
             self.writer.mav.rc_channels_override_send(*self.target, *release)
-        if self.arbiter.take_disarm(now_ms):
-            # Normal disarm only; param2 remains zero (never force disarm).
-            self.writer.mav.command_long_send(*self.target, mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                                               0, 0, 0, 0, 0, 0, 0, 0)
         if owner != "browser":
             return
         if self.last_override_ms is None or now_ms - self.last_override_ms >= 20:
