@@ -45,9 +45,6 @@ class Arbiter:
         self.last_channels = None
         self.last_planner_ms = None
         self.release_pending = False
-        self.disarm_pending = False
-        self.disarm_after_ms = None
-        self.browser_drove = False
         self.rejects = {"decode": 0, "offset": 0, "seq": 0, "age": 0}
         self.last_age_ms = None
 
@@ -74,9 +71,6 @@ class Arbiter:
 
     def planner_seen(self, now_ms):
         self.last_planner_ms = now_ms
-        self.disarm_pending = False
-        self.disarm_after_ms = None
-        self.browser_drove = False
         self.owner_at(now_ms)
 
     def owner_at(self, now_ms):
@@ -102,10 +96,6 @@ class Arbiter:
         if abs(self.last_channels[self.throttle_channel - 1] - 992) > 64:
             return False
         self.owner = "browser"
-        # Once driving is granted, fresh browser RC governs the ARM switch.
-        self.disarm_pending = False
-        self.disarm_after_ms = None
-        self.browser_drove = True
         return True
 
     def output(self, now_ms):
@@ -126,30 +116,7 @@ class Arbiter:
             values[channel - 1] = 0
         return tuple(values)
 
-    def request_disarm(self, now_ms):
-        if self.owner_at(now_ms) == "mission-planner":
-            return
-        self.disarm_pending = True
-        # Observe the same 3s window used for Planner priority before entry disarm.
-        self.disarm_after_ms = now_ms + 3000
-
-    def take_disarm(self, now_ms):
-        if self.owner_at(now_ms) == "mission-planner":
-            self.disarm_pending = False
-            return False
-        if self.disarm_after_ms is not None and now_ms < self.disarm_after_ms:
-            return False
-        pending = self.disarm_pending
-        self.disarm_pending = False
-        self.disarm_after_ms = None
-        return pending
-
     def disconnect(self):
-        # RC release alone can leave Rover armed in failsafe HOLD.
-        self.disarm_pending = self.disarm_pending or self.browser_drove
-        if self.browser_drove:
-            self.disarm_after_ms = None
-        self.browser_drove = False
         was_browser = self.owner == "browser"
         self.peer_connected = False
         self.owner = "idle"
