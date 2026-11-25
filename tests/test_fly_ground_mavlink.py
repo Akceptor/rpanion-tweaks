@@ -122,6 +122,86 @@ class AdapterTest(unittest.TestCase):
         self.adapter.send(1000)
         self.assertEqual(self.writer.mav.overrides, [])
 
+class SessionDisarmTest(unittest.TestCase):
+    drive = AdapterTest.drive
+
+    def setUp(self):
+        AdapterTest.setUp(self)
+        self.writer.mav.commands = []
+        self.writer.mav.command_long_send = lambda *args: self.writer.mav.commands.append(args)
+        from fly_ground_peer import PeerProtocol
+        self.protocol = PeerProtocol(self.a, lambda message: None)
+
+    def test_new_session_requests_normal_disarm_without_driving_or_rc_override(self):
+        self.protocol.open(1000)
+        self.adapter.poll(1000)
+        self.adapter.send(1000)
+        self.assertEqual(self.writer.mav.commands, [])
+        self.adapter.send(3999)
+        self.assertEqual(self.writer.mav.commands, [])
+        self.adapter.send(4000)
+        self.assertEqual(self.writer.mav.commands, [(42, 1, 400, 0, 0, 0, 0, 0, 0, 0, 0)])
+        self.assertEqual(self.writer.mav.overrides, [])
+        self.assertEqual(self.a.owner, 'idle')
+        self.adapter.send(4020)
+        self.assertEqual(len(self.writer.mav.commands), 1)
+
+    def test_session_close_disarms_even_after_watchdog_has_paused_driving(self):
+        self.protocol.open(1000)
+        self.adapter.poll(1000)
+        self.adapter.send(1000)
+        self.drive()
+        self.adapter.send(1300)  # watchdog moved owner to idle
+        self.writer.mav.commands.clear()
+        self.protocol.close(1400)
+        self.adapter.send(1400)
+        self.assertEqual(len(self.writer.mav.commands), 1)
+        self.assertEqual(self.writer.mav.commands[0][2:6], (400, 0, 0, 0))
+
+    def test_observer_session_close_does_not_disarm_again(self):
+        self.protocol.open(1000)
+        self.adapter.poll(1000)
+        self.adapter.send(1000)
+        self.writer.mav.commands.clear()
+        self.protocol.close(1100)
+        self.adapter.send(1100)
+        self.assertEqual(self.writer.mav.commands, [])
+
+    def test_planner_prevents_new_session_and_close_disarm(self):
+        self.a.planner_seen(999)
+        self.protocol.open(1000)
+        self.adapter.poll(1000)
+        self.adapter.send(1000)
+        self.protocol.close(1100)
+        self.adapter.send(1100)
+        self.assertEqual(self.writer.mav.commands, [])
+
+    def test_planner_takeover_cancels_pending_disarm(self):
+        self.protocol.open(1000)
+        self.a.planner_seen(1001)
+        self.adapter.poll(1001)
+        self.adapter.send(1001)
+        self.adapter.send(5000)
+        self.assertEqual(self.writer.mav.commands, [])
+
+    def test_startup_waits_to_discover_an_existing_planner_before_disarming(self):
+        self.protocol.open(1000)
+        self.adapter.poll(1000)
+        self.adapter.send(1000)
+        self.monitor.messages.append(Message("HEARTBEAT", 255, 190, type=6))
+        self.adapter.poll(2000)
+        self.adapter.send(2000)
+        self.adapter.send(6000)
+        self.assertEqual(self.writer.mav.commands, [])
+
+    def test_granted_browser_control_supersedes_deferred_entry_disarm(self):
+        self.protocol.open(1000)
+        self.adapter.poll(1000)
+        self.drive()
+        self.adapter.send(1000)
+        self.adapter.send(4000)
+        self.assertEqual(self.writer.mav.commands, [])
+
 
 if __name__ == "__main__":
     unittest.main()
